@@ -32,6 +32,9 @@ To avoid over-claiming or reinventing textbook terms, here is the exact line bet
    - **Surgical HTTP `Range` `BF16 -> QL` Backbone Transplant for `80B+` / `120B+` Models (`surgical_ql_80b.py`):**
      - Standard GGUF conversions of giant MoEs (`Qwen3-Coder-Next 80B-A3B`, `gpt-oss-120b`) quantize the Attention/Backbone to `Q8_0`, which corrupts **81.8%** of `BF16` weights (`max 15,090 ULPs` off) because linear integer grids destroy the mantissa of smaller weights sharing a 32-weight block with a larger weight.
      - Using HTTP `Range` requests against HuggingFace `.safetensors` shards, `surgical_ql_80b.py` skips 155 GB of MoE experts on the remote CDN, downloads *only* the 230 `BF16` Backbone tensors (`1.40B` weights, `2.8 GB`) of `Qwen/Qwen3-Coder-Next`, quantizes them into **lossless `12-bit QL` (`Q12H`)**, and splices them into `Qwen3-Coder-Next-QL-Backbone-Q4_K_XL.gguf` (`46.91 GiB`, holding **`45.7 tok/s` @ `d=0..4K`, `44.9 tok/s` @ `d=16K`, and `41.7 tok/s` @ `d=32K`** on 2× B60 + DDR5).
+     - Likewise, `surgical_ql_120b.py` pulls only the 146 `BF16` Backbone tensors (`3.94 GiB`) of `openai/gpt-oss-120b`, converting the 36 `4096`-wide `attn_output` matrices to `QL` (`Q12H`) and keeping the 110 `2880`-wide (`11×256 + 64`) matrices in exact `BF16`, splicing `gpt-oss-120b-QL-Backbone-MXFP4.gguf` (`60.71 GiB`, holding **`428.1 tok/s` prefill / `34.5 tok/s` decode** at `-ncmoe 12 -ts 24/12`, and **`32.4 -> 27.0 tok/s` all the way to `d=32,768`** at `-ncmoe 14 -ts 25/11`).
+   - **On-Die NPU + iGPU "Track Switchman" (`npu_router_switchman.py`):**
+     - Offloads all 48 layers of MoE Router Gate matrices (`ffn_gate_inp.weight`) onto the idle on-die **Intel AI Boost NPU** and **Arrow Lake iGPU** via OpenVINO (`12.59 µs/layer` on NPU, `7.58 µs/layer` on iGPU for `Qwen3-Coder-30B-A3B` `6,144` experts; `42.89 µs/layer` on NPU, `29.93 µs/layer` on iGPU, and **`35,336 layer-routes/sec` combined** for `Qwen3-Coder-Next 80B-A3B` `24,576` experts), freeing the discrete B60 GPUs and AVX2 CPU threads from lookahead router scoring.
 3. **Exponent-Sorted Horner-Bucket + 2D `(Exponent, Mantissa)` Bin-Table Matmul (`horner_relom.py`):**
    - Sorting weights within a block/row by exponent descending (`d = emax - exp` from `0` to `15`) solves three GPU problems at once:
      1. Replaces the 128-byte per-weight nibble array (`4.0 bpw`) with a 16-byte bucket run-length header (`0.5 bpw`).
@@ -63,7 +66,8 @@ To avoid over-claiming or reinventing textbook terms, here is the exact line bet
 
 - `horner_relom.py` / `horner_relom.output.txt` — Exponent-Sorted Horner-Bucket + `RELOM` Zone-Stepped matrix multiply proof on `Qwen2.5-Coder-14B`.
 - `ramoe_dct.py` / `dct_nvme_race.py` / `dct_nvme_race.output.txt` — Dual-Channel NVMe (2:1 `C: + M:`) + Reddit Score + DCT lookahead engine and benchmark on `Qwen3-30B-A3B` routing trace.
-- `surgical_ql_80b.py` / `surgical_ql_120b.py` — Surgical HTTP `Range` `BF16 -> QL (Q12H)` Backbone transplant scripts for `Qwen3-Coder-Next 80B-A3B` and `gpt-oss-120b`.
+- `surgical_ql_80b.py` / `surgical_ql_120b.py` — Surgical HTTP `Range` `BF16 -> QL (Q12H) / BF16` Backbone transplant scripts for `Qwen3-Coder-Next 80B-A3B` and `gpt-oss-120b`.
+- `npu_router_switchman.py` — OpenVINO MoE Router Gate offload across all 48 layers onto the Intel AI Boost NPU and Arrow Lake iGPU.
 - `patches/` — The 5 commits on top of `llama.cpp` (`q12h-moe` branch):
   - `0001` — `Q12H_SLOT_EMPTY = 0xFFFF` sentinel fix, chunked Vulkan dequant dispatch, `BF16` overflow fallback.
   - `0002` — AVX2 `Q12H` CPU dot product (`+63%` decode), direct IEEE-754 bit-shift `Q12H` Vulkan shader, Reddit-score MoE cache with profile prewarm, and DCT GPU+CPU split overlap.

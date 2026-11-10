@@ -6,6 +6,7 @@ dll_path = os.environ.get("GGML_BASE_DLL", "ggml-base.dll")
 base = ctypes.CDLL(dll_path)
 base.ggml_quantize_chunk.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
 base.ggml_quantize_chunk.restype = ctypes.c_size_t
+GGML_TYPE_BF16 = 30
 GGML_TYPE_Q12H = 43
 
 idx = json.loads(urllib.request.urlopen("https://huggingface.co/openai/gpt-oss-120b/resolve/main/model.safetensors.index.json", timeout=15).read().decode())
@@ -69,9 +70,9 @@ with ThreadPoolExecutor(max_workers=8) as ex:
         shard_headers[sh] = (url, base_off, hdr)
 print(f"Fetched all {len(shards)} shard headers in {time.time()-t0:.1f}s!")
 
-# 3. Download ONLY the 146 BF16 backbone tensors via HTTP Range and quantize to Q12H in parallel!
-q12h_blobs = {}
-def fetch_and_quantize(t):
+# 3. Download ONLY the 146 BF16 backbone tensors via HTTP Range and convert to Q12H (for 4096-wide rows) + exact BF16 (for 2880-wide rows)
+blobs = {}
+def fetch_and_convert(t):
     gname = t["name"]
     hname = gguf_to_hf(gname)
     sh = wm[hname]
@@ -83,27 +84,29 @@ def fetch_and_quantize(t):
             raw = urllib.request.urlopen(req, timeout=120).read()
             if len(raw) == (e - s):
                 break
-        except Exception as err:
+        except Exception:
             if attempt == 3: raise
             time.sleep(1)
-    u16 = np.frombuffer(raw, dtype=np.uint16)
-    f32 = np.frombuffer((u16.astype(np.uint32) << 16).tobytes(), dtype=np.float32)
     n_per_row = int(t["dims"][0])
     nrows = int(t["dims"][1])
-    # Exact Q12H byte size: nrows * (n_per_row // 32) * 49? Let's allocate 2x and slice to returned sz!
-    dst = np.zeros((nrows * n_per_row * 2), dtype=np.uint8)
-    sz = base.ggml_quantize_chunk(GGML_TYPE_Q12H, f32.ctypes.data, dst.ctypes.data, 0, nrows, n_per_row, None)
-    return gname, dst[:sz].tobytes()
+    if n_per_row % 256 == 0:
+        u16 = np.frombuffer(raw, dtype=np.uint16)
+        f32 = np.frombuffer((u16.astype(np.uint32) << 16).tobytes(), dtype=np.float32)
+        dst = np.zeros((nrows * n_per_row * 2), dtype=np.uint8)
+        sz = base.ggml_quantize_chunk(GGML_TYPE_Q12H, f32.ctypes.data, dst.ctypes.data, 0, nrows, n_per_row, None)
+        return gname, GGML_TYPE_Q12H, dst[:sz].tobytes()
+    else:
+        return gname, GGML_TYPE_BF16, raw
 
 t1 = time.time()
 with ThreadPoolExecutor(max_workers=8) as ex:
-    for idx_done, (gname, blob) in enumerate(ex.map(fetch_and_quantize, q8_tensors), 1):
-        q12h_blobs[gname] = blob
+    for idx_done, (gname, new_ttype, blob) in enumerate(ex.map(fetch_and_convert, q8_tensors), 1):
+        blobs[gname] = (new_ttype, blob)
         if idx_done % 25 == 0 or idx_done == len(q8_tensors):
-            print(f"  [{idx_done}/{len(q8_tensors)}] quantized to Q12H ({time.time()-t1:.1f}s elapsed)")
+            print(f"  [{idx_done}/{len(q8_tensors)}] converted ({time.time()-t1:.1f}s elapsed)")
 
 # 4. Splice output GGUF
-out_path = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("OUT_GGUF", "gpt-oss-120b-ql-backbone-mxfp4.gguf")
+out_path = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("OUT_GGUF", "gpt-oss-120b-QL-Backbone-MXFP4.gguf")
 t2 = time.time()
 with open(out_path, "wb") as out:
     f_src.seek(0)
@@ -116,11 +119,11 @@ with open(out_path, "wb") as out:
         out.write(struct.pack("<Q", len(nb)) + nb)
         out.write(struct.pack("<I", len(t["dims"])))
         out.write(struct.pack(f"<{len(t['dims'])}Q", *t["dims"]))
-        if gname in q12h_blobs:
-            blob = q12h_blobs[gname]
+        if gname in blobs:
+            new_ttype, blob = blobs[gname]
             raw_len = len(blob)
             aligned_len = (raw_len + 31) // 32 * 32
-            out.write(struct.pack("<IQ", GGML_TYPE_Q12H, cur_off))
+            out.write(struct.pack("<IQ", new_ttype, cur_off))
             plan.append(("MEM", blob, raw_len, aligned_len - raw_len))
         else:
             raw_len = t["n_bytes"]
