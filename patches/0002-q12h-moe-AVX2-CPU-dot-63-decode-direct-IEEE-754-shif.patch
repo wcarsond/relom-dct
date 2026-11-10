@@ -1,0 +1,692 @@
+From 4d2fbb9aa398a61c11959a4f79d6cacc8589f70d Mon Sep 17 00:00:00 2001
+From: wcarsond <wcarsond@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:04:08 -0500
+Subject: [PATCH 2/4] q12h-moe: AVX2 CPU dot (+63% decode), direct IEEE-754
+ shift shader, Reddit-score MoE cache with profile prewarm, and DCT GPU+CPU
+ split overlap
+
+---
+ ggml/src/ggml-backend.cpp                     |  91 +++++++-
+ ggml/src/ggml-cpu/quants.c                    |  87 ++++++-
+ .../vulkan-shaders/dequant_funcs.glsl         |  90 ++++----
+ .../vulkan-shaders/dequant_q12h.comp          |   3 +-
+ src/llama-moe-cache.cpp                       | 213 +++++++++++++++++-
+ 5 files changed, 414 insertions(+), 70 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 22e5fd9c7..0b7028bd3 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1873,13 +1873,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        // Dual-Clutch Overlap (DCT): When the GPU (prev_backend_id) finishes enqueueing its half of a split
++        // (e.g. resident MoE experts `out_hit`) and the next split is the CPU (split_backend_id) computing
++        // the missed experts (`out_miss`), if the CPU split only depends on an ALREADY-SYNCHRONIZED tensor
++        // (or if `GGML_SCHED_OVERLAP_CPU=1` is set and the CPU split does not read the immediately preceding
++        // GPU split's output), do NOT block the CPU waiting for the GPU to finish! Let the GPU and CPU shafts
++        // run their halves in parallel, and synchronize only when their outputs are added together!
++        static const bool dct_overlap = getenv("GGML_SCHED_OVERLAP_CPU") == nullptr || atoi(getenv("GGML_SCHED_OVERLAP_CPU")) != 0;
++        const bool is_cpu_split = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+-            } else {
+-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
++            if (!(dct_overlap && is_cpu_split)) {
++                if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
++                    ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
++                } else {
++                    ggml_backend_synchronize(sched->backends[prev_backend_id]);
++                }
+             }
+         }
+ 
+@@ -1897,9 +1908,75 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+ 
+         if (!sched->callback_eval) {
+-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+-            if (ec != GGML_STATUS_SUCCESS) {
+-                return ec;
++            // Dual-Clutch Overlap (DCT): if this GPU split has `n_nodes > 4` and is immediately followed by a
++            // CPU split whose ONLY input from this GPU split is `split->graph.nodes[0]` (i.e. `ffn_moe_misses`),
++            // compute `nodes[0..0]` first, copy the CPU split's small inputs to the CPU (which only waits for
++            // `nodes[0]`), and THEN launch `nodes[1..n_nodes-1]` (`out_hit`) asynchronously on the GPU right before
++            // the CPU split executes `out_miss`! Both shafts (GPU `out_hit` + CPU `out_miss`) then run simultaneously!
++            bool split_overlapped = false;
++            if (dct_overlap && !is_cpu_split && split->graph.n_nodes > 4 && split_id + 1 < sched->n_splits) {
++                struct ggml_backend_sched_split * next_split = &splits[split_id + 1];
++                ggml_backend_t next_backend = sched->backends[next_split->backend_id];
++                if (ggml_backend_dev_type(ggml_backend_get_device(next_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    int max_prod = -1;
++                    for (int inp_i = 0; inp_i < next_split->n_inputs; inp_i++) {
++                        struct ggml_tensor * inp = next_split->inputs[inp_i];
++                        struct ggml_tensor * base = inp->view_src ? inp->view_src : inp;
++                        for (int k = 0; k < split->graph.n_nodes; k++) {
++                            if (split->graph.nodes[k] == inp || split->graph.nodes[k] == base) {
++                                max_prod = std::max(max_prod, k);
++                            }
++                        }
++                    }
++                    if (max_prod == 0) {
++                        // 1. Run node 0 (`ffn_moe_misses` GET_ROWS) on GPU
++                        struct ggml_cgraph gv_head = ggml_graph_view(&split->graph, 0, 1);
++                        enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv_head);
++                        if (ec != GGML_STATUS_SUCCESS) {
++                            return ec;
++                        }
++                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
++                        }
++                        // 2. Copy the small inputs (`ffn_norm` + `ffn_moe_misses`) to the CPU now (waits only for `gv_head`)
++                        for (int inp_i = 0; inp_i < next_split->n_inputs; inp_i++) {
++                            if (!ggml_backend_sched_is_host_weight(next_split->inputs[inp_i])) {
++                                ggml_backend_sched_copy_input(sched, next_split, next_split->inputs[inp_i]);
++                            }
++                        }
++                        for (int inp_i = 0; inp_i < next_split->n_inputs; inp_i++) {
++                            if (ggml_backend_sched_is_host_weight(next_split->inputs[inp_i])) {
++                                ggml_backend_sched_copy_input(sched, next_split, next_split->inputs[inp_i]);
++                            }
++                        }
++                        // 3. Launch `gv_tail` (`out_hit` on GPU) asynchronously!
++                        struct ggml_cgraph gv_tail = ggml_graph_view(&split->graph, 1, split->graph.n_nodes);
++                        ec = ggml_backend_graph_compute_async(split_backend, &gv_tail);
++                        if (ec != GGML_STATUS_SUCCESS) {
++                            return ec;
++                        }
++                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
++                        }
++                        // 4. Immediately run `next_split` (`out_miss` on CPU) while the GPU is computing `gv_tail`!
++                        ec = ggml_backend_graph_compute_async(next_backend, &next_split->graph);
++                        if (ec != GGML_STATUS_SUCCESS) {
++                            return ec;
++                        }
++                        if (sched->events[next_split->backend_id][sched->cur_copy] != NULL) {
++                            ggml_backend_event_record(sched->events[next_split->backend_id][sched->cur_copy], next_backend);
++                        }
++                        prev_backend_id = next_split->backend_id;
++                        split_id++; // skip next_split since we just ran it in parallel!
++                        continue;
++                    }
++                }
++            }
++            if (!split_overlapped) {
++                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++                if (ec != GGML_STATUS_SUCCESS) {
++                    return ec;
++                }
+             }
+         } else {
+             // similar to ggml_backend_compare_graph_backend
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 8e90367a6..dd8cd92ea 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -203,6 +203,86 @@ void ggml_vec_dot_q12h_f32(int n, float * GGML_RESTRICT s, size_t bs, const void
+     double acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+ 
+     for (int i = 0; i < nb; i++) {
++        const float * GGML_RESTRICT yb = y + (size_t)i*qk;
++#if defined(__AVX2__)
++        const __m128i mask_0f   = _mm_set1_epi8(0x0F);
++        const __m256i mask_sign = _mm256_set1_epi16((short)0x0080);
++        const __m256i mask_mant = _mm256_set1_epi16(0x007F);
++        __m256 c0 = _mm256_setzero_ps();
++        __m256 c1 = _mm256_setzero_ps();
++        __m256 c2 = _mm256_setzero_ps();
++        __m256 c3 = _mm256_setzero_ps();
++
++        if (x[i].lut[0] == Q12H_MODE_SHIFT) {
++            const __m128i v_emin = _mm_set1_epi8((char)x[i].lut[1]);
++            for (int j = 0; j < qk; j += 16) {
++                const __m128i raw_nib  = _mm_loadl_epi64((const __m128i *)(x[i].nib + (j >> 1)));
++                const __m128i nib_even = _mm_and_si128(raw_nib, mask_0f);
++                const __m128i nib_odd  = _mm_and_si128(_mm_srli_epi16(raw_nib, 4), mask_0f);
++                const __m128i ix_16    = _mm_unpacklo_epi8(nib_even, nib_odd);
++                const __m128i exp_8    = _mm_add_epi8(ix_16, v_emin);
++                const __m256i exp_16   = _mm256_slli_epi16(_mm256_cvtepu8_epi16(exp_8), 7);
++
++                const __m128i sm_8     = _mm_loadu_si128((const __m128i *)(x[i].sm + j));
++                const __m256i sm_16    = _mm256_cvtepu8_epi16(sm_8);
++                const __m256i sign_16  = _mm256_slli_epi16(_mm256_and_si256(sm_16, mask_sign), 8);
++                const __m256i mant_16  = _mm256_and_si256(sm_16, mask_mant);
++                const __m256i bf16_16  = _mm256_or_si256(_mm256_or_si256(sign_16, exp_16), mant_16);
++
++                const __m128i bf_lo    = _mm256_castsi256_si128(bf16_16);
++                const __m128i bf_hi    = _mm256_extracti128_si256(bf16_16, 1);
++                const __m256  wx0      = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bf_lo), 16));
++                const __m256  wx1      = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bf_hi), 16));
++                const __m256  wy0      = _mm256_loadu_ps(yb + j);
++                const __m256  wy1      = _mm256_loadu_ps(yb + j + 8);
++                if (j & 16) {
++                    c2 = _mm256_fmadd_ps(wx0, wy0, c2);
++                    c3 = _mm256_fmadd_ps(wx1, wy1, c3);
++                } else {
++                    c0 = _mm256_fmadd_ps(wx0, wy0, c0);
++                    c1 = _mm256_fmadd_ps(wx1, wy1, c1);
++                }
++            }
++        } else {
++            uint16_t bf[QK12H];
++            const __m128i v_lut = _mm_loadu_si128((const __m128i *)x[i].lut);
++            for (int j = 0; j < qk; j += 16) {
++                const __m128i raw_nib  = _mm_loadl_epi64((const __m128i *)(x[i].nib + (j >> 1)));
++                const __m128i nib_even = _mm_and_si128(raw_nib, mask_0f);
++                const __m128i nib_odd  = _mm_and_si128(_mm_srli_epi16(raw_nib, 4), mask_0f);
++                const __m128i ix_16    = _mm_unpacklo_epi8(nib_even, nib_odd);
++                const __m128i exp_8    = _mm_shuffle_epi8(v_lut, ix_16);
++                const __m256i exp_16   = _mm256_slli_epi16(_mm256_cvtepu8_epi16(exp_8), 7);
++
++                const __m128i sm_8     = _mm_loadu_si128((const __m128i *)(x[i].sm + j));
++                const __m256i sm_16    = _mm256_cvtepu8_epi16(sm_8);
++                const __m256i sign_16  = _mm256_slli_epi16(_mm256_and_si256(sm_16, mask_sign), 8);
++                const __m256i mant_16  = _mm256_and_si256(sm_16, mask_mant);
++                const __m256i bf16_16  = _mm256_or_si256(_mm256_or_si256(sign_16, exp_16), mant_16);
++                _mm256_storeu_si256((__m256i *)(bf + j), bf16_16);
++            }
++            for (int t = 0; t < 4; t++) {
++                const uint16_t v = x[i].eval[t];
++                if (v == Q12H_SLOT_EMPTY) break;
++                bf[x[i].epos[t]] = v;
++            }
++            for (int j = 0; j < qk; j += 32) {
++                const __m256 wx0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(bf + j))), 16));
++                const __m256 wx1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(bf + j + 8))), 16));
++                const __m256 wx2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(bf + j + 16))), 16));
++                const __m256 wx3 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(bf + j + 24))), 16));
++                c0 = _mm256_fmadd_ps(wx0, _mm256_loadu_ps(yb + j),      c0);
++                c1 = _mm256_fmadd_ps(wx1, _mm256_loadu_ps(yb + j + 8),  c1);
++                c2 = _mm256_fmadd_ps(wx2, _mm256_loadu_ps(yb + j + 16), c2);
++                c3 = _mm256_fmadd_ps(wx3, _mm256_loadu_ps(yb + j + 24), c3);
++            }
++        }
++        const __m256 csum = _mm256_add_ps(_mm256_add_ps(c0, c2), _mm256_add_ps(c1, c3));
++        __m128 g = _mm_add_ps(_mm256_extractf128_ps(csum, 1), _mm256_castps256_ps128(csum));
++        g = _mm_add_ps(g, _mm_movehl_ps(g, g));
++        g = _mm_add_ss(g, _mm_movehdup_ps(g));
++        acc0 += (double)_mm_cvtss_f32(g);
++#else
+         // Decoded here rather than through dequantize_row_q12h() so the loop stays
+         // in this translation unit and keeps vectorising - calling across to
+         // ggml-quants.c costs about 2.6x on this path.
+@@ -227,20 +307,21 @@ void ggml_vec_dot_q12h_f32(int n, float * GGML_RESTRICT s, size_t bs, const void
+                 memcpy(&xb[j], &u, sizeof(float));
+             }
+             for (int t = 0; t < 4; t++) {
++                const uint16_t v = x[i].eval[t];
++                if (v == Q12H_SLOT_EMPTY) break;   // the marker is in the value; 0xFF is a legal position
+                 const uint8_t p = x[i].epos[t];
+-                if (p == 0xFF) break;
+-                const uint32_t u = (uint32_t)x[i].eval[t] << 16;
++                const uint32_t u = (uint32_t)v << 16;
+                 memcpy(&xb[p], &u, sizeof(float));
+             }
+         }
+ 
+-        const float * GGML_RESTRICT yb = y + (size_t)i*qk;
+         for (int j = 0; j < qk; j += 4) {
+             acc0 += (double)(xb[j    ] * yb[j    ]);
+             acc1 += (double)(xb[j + 1] * yb[j + 1]);
+             acc2 += (double)(xb[j + 2] * yb[j + 2]);
+             acc3 += (double)(xb[j + 3] * yb[j + 3]);
+         }
++#endif
+     }
+ 
+     *s = (float)(acc0 + acc1 + acc2 + acc3);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+index 99af3f635..e9f7678fb 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+@@ -545,22 +545,27 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+ #endif
+ 
+ #if defined(DATA_A_Q12H)
+-// Apply the block's exception slots to weight j. The slots are filled in order and
+-// 0xFF terminates the list, so the scan breaks there exactly like
+-// dequantize_row_q12h() on the CPU does. All four slots empty reads as 0xFFFFFFFF,
++// Apply the block's exception slots to weight j. The slots are filled in order and an
++// empty slot carries the VALUE 0xFFFF (Q12H_SLOT_EMPTY, a NaN no weight can be), so the
++// scan breaks there exactly like dequantize_row_q12h() on the CPU does. The position
++// byte carries no marker: 0xFF is the legal position 255 (the old epos == 0xFF marker
++// mis-decoded every exception at position 255; 2026-10-31). Slot 0 empty means all empty,
+ // which is the common case by far and is uniform across the whole block.
++bool q12h_no_except(uint ibi) {
++    return (data_a_packed32[ibi].eval[0] & 0xFFFFu) == 0xFFFFu;
++}
+ uint q12h_except(uint ibi, uint j, uint bits) {
+-    const uint ep = data_a_packed32[ibi].epos;
+-    if (ep == 0xFFFFFFFF) {
++    if (q12h_no_except(ibi)) {
+         return bits;
+     }
++    const uint ep = data_a_packed32[ibi].epos;
+     for (uint s = 0; s < 4; ++s) {
+-        const uint p = (ep >> (8 * s)) & 0xFF;
+-        if (p == 0xFF) {
++        const uint v = uint(data_a[ibi].eval[s]);
++        if (v == 0xFFFFu) {
+             break;
+         }
+-        if (p == j) {
+-            bits = uint(data_a[ibi].eval[s]);
++        if (((ep >> (8 * s)) & 0xFF) == j) {
++            bits = v;
+         }
+     }
+     return bits;
+@@ -573,15 +578,17 @@ bool q12h_is_shift(uint ibi) {
+     return uint(data_a[ibi].lut[0]) == 0xFF;
+ }
+ 
+-// sign(1) << 15 | lut[nibble] << 7 | mantissa(7); bf16 -> f32 is a 16-bit left shift
++// sign(1) << 15 | exp << 7 | mantissa(7); bf16 -> f32 is a 16-bit left shift.
++// In shift mode (lut[0] == 0xFF), exp = lut[1] + ix directly in the IEEE-754 exponent field:
++// no int-to-float conversion and no per-block get_dm scale multiply.
+ float q12h_dequant1(uint ibi, uint j) {
+-    const uint sm = uint(data_a[ibi].sm[j]);
+-    const uint nb = uint(data_a[ibi].nib[j >> 1]);
+-    const uint ix = ((j & 1) != 0) ? (nb >> 4) : (nb & 0xF);
+-    if (q12h_is_shift(ibi)) {
+-        // ((128+m) << offset), signed; the 2^(base-134) scale comes from get_dm
+-        const float mag = float((128 + (sm & 0x7F)) << ix);
+-        return (sm & 0x80) != 0 ? -mag : mag;
++    const uint sm    = uint(data_a[ibi].sm[j]);
++    const uint nb    = uint(data_a[ibi].nib[j >> 1]);
++    const uint ix    = ((j & 1) != 0) ? (nb >> 4) : (nb & 0xF);
++    const uint lut01 = uint(data_a_packed16[ibi].lut[0]);
++    if ((lut01 & 0xFFu) == 0xFFu) {
++        const uint emin = lut01 >> 8;
++        return uintBitsToFloat(((sm & 0x80u) << 24) | ((emin + ix) << 23) | ((sm & 0x7Fu) << 16));
+     }
+     uint bits = ((sm & 0x80) << 8) | (uint(data_a[ibi].lut[ix]) << 7) | (sm & 0x7F);
+     bits = q12h_except(ibi, j, bits);
+@@ -592,14 +599,15 @@ FLOAT_TYPE dequantize1(uint ib, uint iqs, uint a_offset) {
+ }
+ // iqs must be even: one 16-bit sm load and one nibble byte cover both weights
+ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+-    const uint ibi = a_offset + ib;
+-    const uint sm2 = uint(data_a_packed16[ibi].sm[iqs >> 1]);
+-    const uint nb  = uint(data_a[ibi].nib[iqs >> 1]);
+-    const uvec2 s  = uvec2(sm2, sm2 >> 8) & 0xFF;
+-    const uvec2 ix = uvec2(nb, nb >> 4)   & 0xF;
+-    if (q12h_is_shift(ibi)) {
+-        const uvec2 mag = floatBitsToUint(vec2((128 + (s & 0x7F)) << ix));
+-        return uintBitsToFloat(mag | ((s & 0x80) << 24));
++    const uint  ibi   = a_offset + ib;
++    const uint  sm2   = uint(data_a_packed16[ibi].sm[iqs >> 1]);
++    const uint  nb    = uint(data_a[ibi].nib[iqs >> 1]);
++    const uvec2 s     = uvec2(sm2, sm2 >> 8) & 0xFF;
++    const uvec2 ix    = uvec2(nb, nb >> 4)   & 0xF;
++    const uint  lut01 = uint(data_a_packed16[ibi].lut[0]);
++    if ((lut01 & 0xFFu) == 0xFFu) {
++        const uint emin = lut01 >> 8;
++        return uintBitsToFloat(((s & 0x80u) << 24) | ((emin + ix) << 23) | ((s & 0x7Fu) << 16));
+     }
+     uint b0 = ((s.x & 0x80) << 8) | (uint(data_a[ibi].lut[ix.x]) << 7) | (s.x & 0x7F);
+     uint b1 = ((s.y & 0x80) << 8) | (uint(data_a[ibi].lut[ix.y]) << 7) | (s.y & 0x7F);
+@@ -610,26 +618,22 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+ // iqs must be a multiple of 4: one 32-bit sm load and one 16-bit nibble load cover
+ // all four weights, which is what makes this worth doing on a byte-load-shy GPU
+ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+-    const uint ibi = a_offset + ib;
+-    const uint  sm4 = data_a_packed32[ibi].sm[iqs >> 2];
+-    const uint  nb2 = uint(data_a_packed16[ibi].nib[iqs >> 2]);
+-    const uvec4 s   = uvec4(sm4, sm4 >> 8, sm4 >> 16, sm4 >> 24) & 0xFF;
+-    const uvec4 ix  = uvec4(nb2, nb2 >> 4, nb2 >>  8, nb2 >> 12) & 0xF;
+-    if (q12h_is_shift(ibi)) {
+-        // The whole point of v2: an integer shift instead of four lut[] gathers.
+-        // The sign is OR'd straight into bit 31 (sm bit 7 << 24) rather than
+-        // selected - in GLSL `uvec4 != uvec4` collapses to a SCALAR bool, so a
+-        // mix()/bvec4 selector would negate all four lanes whenever any one of
+-        // them was negative. The 2^(base-134) scale comes out through get_dm.
+-        const uvec4 mag = floatBitsToUint(vec4((128 + (s & 0x7F)) << ix));
+-        return uintBitsToFloat(mag | ((s & 0x80) << 24));
++    const uint  ibi   = a_offset + ib;
++    const uint  sm4   = data_a_packed32[ibi].sm[iqs >> 2];
++    const uint  nb2   = uint(data_a_packed16[ibi].nib[iqs >> 2]);
++    const uvec4 s     = uvec4(sm4, sm4 >> 8, sm4 >> 16, sm4 >> 24) & 0xFF;
++    const uvec4 ix    = uvec4(nb2, nb2 >> 4, nb2 >>  8, nb2 >> 12) & 0xF;
++    const uint  lut01 = uint(data_a_packed16[ibi].lut[0]);
++    if ((lut01 & 0xFFu) == 0xFFu) {
++        const uint emin = lut01 >> 8;
++        return uintBitsToFloat(((s & 0x80u) << 24) | ((emin + ix) << 23) | ((s & 0x7Fu) << 16));
+     }
+     uvec4 b = ((s & 0x80) << 8) | (s & 0x7F);
+     b.x |= uint(data_a[ibi].lut[ix.x]) << 7;
+     b.y |= uint(data_a[ibi].lut[ix.y]) << 7;
+     b.z |= uint(data_a[ibi].lut[ix.z]) << 7;
+     b.w |= uint(data_a[ibi].lut[ix.w]) << 7;
+-    if (data_a_packed32[ibi].epos != 0xFFFFFFFF) {
++    if (!q12h_no_except(ibi)) {
+         b.x = q12h_except(ibi, iqs,     b.x);
+         b.y = q12h_except(ibi, iqs + 1, b.y);
+         b.z = q12h_except(ibi, iqs + 2, b.z);
+@@ -638,15 +642,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+     return vec4(uintBitsToFloat(b.x << 16), uintBitsToFloat(b.y << 16),
+                 uintBitsToFloat(b.z << 16), uintBitsToFloat(b.w << 16));
+ }
+-// In shift mode the block's 2^(base-134) comes out here and mul_mat_vec applies it
+-// once per 8 weights - which never cross a block - after the dot product. Scaling
+-// by a power of two is exact and commutes with rounding, so pulling it out of the
+-// inner loop keeps the result bit-identical to multiplying each weight by it.
+ vec2 get_dm(uint ib, uint a_offset) {
+-    const uint ibi = a_offset + ib;
+-    if (q12h_is_shift(ibi)) {
+-        return vec2(uintBitsToFloat((uint(data_a[ibi].lut[1]) - 7) << 23), 0.0);
+-    }
+     return vec2(1.0, 0.0);
+ }
+ #endif
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+index 49df3305c..3360236ce 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q12h.comp
+@@ -34,8 +34,7 @@ void main() {
+ 
+         const uint b_idx = ib * QUANT_K + j;
+ 
+-        // get_dm carries the 2^(base-134) scale in shift-offset mode, and 1.0 in LUT mode
+-        const vec4 v = dequantize4(ib, j, 0) * get_dm(ib, 0).x;
++        const vec4 v = dequantize4(ib, j, 0);
+ 
+         data_b[b_idx    ] = D_TYPE(v.x);
+         data_b[b_idx + 1] = D_TYPE(v.y);
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ee6ecb43a..51b2a907e 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -34,6 +34,24 @@ struct moe_cache_slru {
+     std::vector<bool> is_protected;
+     int32_t n_protected = 0;
+ 
++    // Reddit-style frequency + hotness scoring and Dual-Clutch Transmission (DCT) state for split mode:
++    // Every expert across all layers keeps a decayed frequency score + recency timestamp, even when not resident.
++    // In DCT split mode, when a missed expert's Reddit score beats the coldest resident slot, it is uploaded into the
++    // background clutch slot (`clutch_b`: slot `n_slots`) while the CPU computes the current token's miss without
++    // stalling on the upload. On the next token, `clutch_b` swaps with the victim slot in O(1) pointer time!
++    std::vector<float>   freq_score; // [n_layer * n_expert]
++    std::vector<int32_t> last_used;  // [n_layer * n_expert]
++    int32_t              step_clock = 0;
++
++    struct clutch_swap {
++        int32_t il         = -1;
++        int32_t new_expert = -1;
++        int32_t old_expert = -1;
++        int32_t victim_slot = -1;
++        int32_t clutch_slot = -1;
++    };
++    clutch_swap pending_clutch;
++
+     std::vector<uint32_t> seen; // [n_expert]
+     uint32_t seen_gen = 0;
+     std::vector<int32_t> uniq;
+@@ -43,7 +61,7 @@ struct moe_cache_slru {
+         this->n_slots  = n_slots;
+         slot_map.assign(n_layer, nullptr);
+         cpu_map.assign(n_layer, nullptr);
+-        key_of.assign(n_slots, -1);
++        key_of.assign(n_slots + 1, -1);
+         prev.resize(n_slots);
+         next.resize(n_slots);
+         for (int32_t s = 0; s < n_slots; ++s) {
+@@ -54,6 +72,17 @@ struct moe_cache_slru {
+         tail[0] = n_slots - 1;
+         is_protected.assign(n_slots, false);
+         seen.assign(n_expert, 0);
++        freq_score.assign((size_t)n_layer * n_expert, 0.0f);
++        last_used.assign((size_t)n_layer * n_expert, -1000);
++        step_clock = 0;
++        pending_clutch = {};
++    }
++
++    float reddit_score(int32_t il, int32_t e) const {
++        const size_t idx = (size_t)il * n_expert + e;
++        const int32_t age = step_clock - last_used[idx];
++        const float hot_bonus = (age <= 12) ? (2.5f / (1.0f + 0.1f * (float)std::max(0, age))) : 0.0f;
++        return freq_score[idx] + hot_bonus;
+     }
+ 
+     // move slot s to the most recently used end of a segment
+@@ -93,15 +122,31 @@ struct moe_cache_slru {
+     }
+ 
+     int32_t victim(int32_t il) const {
++        // Reddit-score victim selection: among resident slots not used by the current request,
++        // evict the slot with the lowest combined frequency + hotness score.
++        int32_t best_s = -1;
++        float   best_score = 1e30f;
+         for (int segment = 0; segment < 2; ++segment) {
+             for (int32_t s = head[segment]; s >= 0; s = next[s]) {
+                 const int32_t key = key_of[s];
+-                // keep every expert selected by this request, including earlier fills
+-                if (key < 0 || key / n_expert != il || seen[key % n_expert] != seen_gen) {
++                if (key < 0) {
+                     return s;
+                 }
++                const int32_t k_il = key / n_expert;
++                const int32_t k_e  = key % n_expert;
++                if (k_il == il && seen[k_e] == seen_gen) {
++                    continue;
++                }
++                const float sc = reddit_score(k_il, k_e);
++                if (sc < best_score) {
++                    best_score = sc;
++                    best_s     = s;
++                }
+             }
+         }
++        if (best_s >= 0) {
++            return best_s;
++        }
+         GGML_ABORT("no SLRU victim");
+     }
+ 
+@@ -135,13 +180,33 @@ struct moe_cache_slru {
+         int32_t slot;
+     };
+ 
+-    // give a slot to each expert selected by ids in layer il, evicting from probation first
++    // give a slot to each expert selected by ids in layer il, evicting by Reddit score (decayed frequency + hotness)
+     // returns false if the ids select more distinct experts than there are slots
+     bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, size_t & n_miss) {
+         fills.clear();
+         n_hit  = 0;
+         n_miss = 0;
+ 
++        // Periodic Reddit gravity decay every 64 layer calls
++        if (++step_clock % 64 == 0) {
++            for (float & f : freq_score) {
++                f *= 0.90f;
++            }
++        }
++
++        // Engage any pending DCT Clutch-B swap that finished uploading during the previous step!
++        if (pending_clutch.il >= 0) {
++            const auto & pc = pending_clutch;
++            if (pc.old_expert >= 0 && slot_map[pc.il] != nullptr) {
++                set_resident(pc.il, pc.old_expert, -1);
++            }
++            if (slot_map[pc.il] != nullptr) {
++                set_resident(pc.il, pc.new_expert, pc.victim_slot);
++            }
++            key_of[pc.victim_slot] = pc.il * n_expert + pc.new_expert;
++            pending_clutch = {};
++        }
++
+         if (++seen_gen == 0) {
+             std::fill(seen.begin(), seen.end(), 0);
+             seen_gen = 1;
+@@ -163,8 +228,11 @@ struct moe_cache_slru {
+ 
+         int32_t * slots = slot_map[il];
+ 
+-        // promote hits before choosing victims for misses
++        // Update Reddit frequency & recency scores for all requested experts, and promote hits
+         for (int32_t e : uniq) {
++            const size_t idx = (size_t)il * n_expert + e;
++            freq_score[idx] += 1.0f;
++            last_used[idx]   = step_clock;
+             if (slots[e] >= 0) {
+                 touch(slots[e]);
+                 n_hit++;
+@@ -177,10 +245,34 @@ struct moe_cache_slru {
+                 continue;
+             }
+             n_miss++;
+-            // split mode only claims slots nobody has used yet: the cache warms up over the first
+-            // tokens and is then left alone. Evicting to make room for this token's miss would put
+-            // the upload back on the critical path, which is the whole cost being removed here.
+-            const int32_t s = split ? empty_slot() : victim(il);
++            if (split) {
++                const int32_t s = empty_slot();
++                if (s >= 0) {
++                    key_of[s] = il*n_expert + e;
++                    set_resident(il, e, s);
++                    move(s, false);
++                    fills.push_back({ e, s });
++                } else if (pending_clutch.il < 0 && getenv("GGML_MOE_DCT") != nullptr) {
++                    // DCT Clutch-B background promotion: if this missed expert's Reddit score beats
++                    // the coldest resident slot by a hysteresis margin (1.0), stage it into the victim
++                    // slot for NEXT token while the CPU computes it on this token!
++                    const int32_t v_slot = victim(il);
++                    const int32_t v_key  = key_of[v_slot];
++                    const int32_t v_il   = v_key / n_expert;
++                    const int32_t v_e    = v_key % n_expert;
++                    if (reddit_score(il, e) >= reddit_score(v_il, v_e) + 1.0f) {
++                        // Evict old expert from GPU map now so this token's GPU kernel won't read v_slot while we upload
++                        set_resident(v_il, v_e, -1);
++                        key_of[v_slot] = -1;
++                        // Keep new_expert on CPU for this token (`set_resident` happens at the start of next plan!),
++                        // and queue the async upload into v_slot right now (Clutch B).
++                        pending_clutch = { il, e, -1, v_slot, v_slot };
++                        fills.push_back({ e, v_slot });
++                    }
++                }
++                continue;
++            }
++            const int32_t s = victim(il);
+             if (s < 0) {
+                 continue;
+             }
+@@ -644,9 +736,108 @@ struct llama_moe_cache::impl {
+         // measured ~5 ms/token of uploads against ~24 ms/token of stalling, 48 times per token.
+         // The hit rate logged at the end therefore covers the warm-up only; after the freeze the
+         // split is static and its hit rate is whatever the warm-up happened to leave resident.
++        // In default split mode, once full, the cache freezes to avoid the per-layer device synchronize.
++        // When GGML_MOE_DCT=1 is set, the cache uses periodic Reddit-score Clutch-B promotions (sampling
++        // every Nth token or when not yet full) so residency adapts to topic shifts without stalling every layer.
++        static const int dct_period = getenv("GGML_MOE_DCT") ? std::max(1, atoi(getenv("GGML_MOE_DCT"))) : 0;
+         if (split && g.slru.full()) {
+-            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+-            return true;
++            if (dct_period == 0 || (++g.slru.step_clock % dct_period != 0)) {
++                ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++                return true;
++            }
++        }
++
++        // Prewarm from a routing profile (`LLAMA_MOE_PROFILE=<path.moeprof|path.imatrix>`) on the very
++        // first call of a split cache: reads `MOEP` binary profile (or GGUF imatrix `.counts`),
++        // ranks all (layer, expert) pairs in this group by activation count, and uploads the top
++        // `n_slots` experts straight into the device banks in one shot!
++        // That way the split cache starts at ~65-85% hit rate from token 0 with zero per-layer sync stalls.
++        static const char * prof_path = getenv("LLAMA_MOE_PROFILE");
++        if (split && prof_path != nullptr && *prof_path != '\0' && g.slru.fill_cursor == 0) {
++            struct cand { float count; int32_t il; int32_t e; };
++            std::vector<cand> cands;
++            FILE * fp = fopen(prof_path, "rb");
++            if (fp) {
++                char magic[4] = {};
++                if (fread(magic, 1, 4, fp) == 4 && memcmp(magic, "MOEP", 4) == 0) {
++                    int32_t p_L = 0, p_E = 0;
++                    if (fread(&p_L, 4, 1, fp) == 1 && fread(&p_E, 4, 1, fp) == 1 && p_E == g.slru.n_expert) {
++                        for (int32_t gil : g.layers) {
++                            if (gil < p_L) {
++                                std::vector<float> buf(p_E, 0.0f);
++                                fseek(fp, (long)(12 + (size_t)gil * p_E * sizeof(float)), SEEK_SET);
++                                if (fread(buf.data(), sizeof(float), p_E, fp) == (size_t)p_E) {
++                                    for (int32_t e = 0; e < p_E; ++e) {
++                                        cands.push_back({ buf[e], gil, e });
++                                        g.slru.freq_score[(size_t)gil * p_E + e] = buf[e];
++                                    }
++                                }
++                            }
++                        }
++                    }
++                    fclose(fp);
++                } else {
++                    fclose(fp);
++                    struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
++                    struct gguf_context * gctx = gguf_init_from_file(prof_path, gp);
++                    if (gctx != nullptr) {
++                        FILE * fp2 = fopen(prof_path, "rb");
++                        if (fp2) {
++                            for (int32_t gil : g.layers) {
++                                char tname[128];
++                                snprintf(tname, sizeof(tname), "blk.%d.ffn_gate_exps.weight.counts", gil);
++                                int64_t tid = gguf_find_tensor(gctx, tname);
++                                if (tid < 0) {
++                                    snprintf(tname, sizeof(tname), "blk.%d.ffn_down_exps.weight.counts", gil);
++                                    tid = gguf_find_tensor(gctx, tname);
++                                }
++                                if (tid >= 0) {
++                                    std::vector<float> buf(g.slru.n_expert, 0.0f);
++                                    fseek(fp2, (long)(gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid)), SEEK_SET);
++                                    if (fread(buf.data(), sizeof(float), buf.size(), fp2) == buf.size()) {
++                                        for (int32_t e = 0; e < g.slru.n_expert; ++e) {
++                                            cands.push_back({ buf[e], gil, e });
++                                            g.slru.freq_score[(size_t)gil * g.slru.n_expert + e] = buf[e];
++                                        }
++                                    }
++                                }
++                            }
++                            fclose(fp2);
++                        }
++                        gguf_free(gctx);
++                    }
++                }
++                if (!cands.empty()) {
++                    std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.count > b.count; });
++                    const int32_t n_take = std::min<int32_t>((int32_t)cands.size(), g.n_slots);
++                    // Sort chosen winners by (il, expert) so consecutive experts upload in merged DMA transfers
++                    std::sort(cands.begin(), cands.begin() + n_take, [](const cand & a, const cand & b) {
++                        return a.il != b.il ? a.il < b.il : a.e < b.e;
++                    });
++                    for (int32_t k = 0; k < n_take; ++k) {
++                        const int32_t s   = g.slru.empty_slot();
++                        const int32_t cil = cands[k].il;
++                        const int32_t ce  = cands[k].e;
++                        g.slru.key_of[s]  = cil * g.slru.n_expert + ce;
++                        g.slru.set_resident(cil, ce, s);
++                        g.slru.move(s, true);
++                        const layer & cl = layers[cil];
++                        for (size_t ip = 0; ip < cl.experts.size(); ++ip) {
++                            const ggml_tensor * w    = cl.experts[ip];
++                            ggml_tensor       * bank = g.banks[ip];
++                            const size_t expert_size = w->nb[2];
++                            ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + ce * expert_size, s * expert_size, expert_size);
++                        }
++                    }
++                    // Push all updated slot_map and cpu_map tensors for every layer in this group to the GPU!
++                    for (int32_t gil : g.layers) {
++                        plan_pending[gil] = 0;
++                    }
++                    LLAMA_LOG_INFO("llama_moe_cache: prewarmed %d slots across %zu layers from profile '%s'\n", n_take, g.layers.size(), prof_path);
++                    ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++                    return true;
++                }
++            }
+         }
+ 
+         // the get_rows that looks up the slots of the selected experts
+-- 
+2.55.0.windows.3
+

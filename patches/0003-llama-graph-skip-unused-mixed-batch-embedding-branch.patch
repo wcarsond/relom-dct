@@ -1,0 +1,32 @@
+From e69cef7b236af5da557dacb36edaaa869e47396b Mon Sep 17 00:00:00 2001
+From: wcarsond <wcarsond@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:31:10 -0500
+Subject: [PATCH 3/4] llama-graph: skip unused mixed-batch embedding branches
+ on pure token batches (-95% RPC head wire traffic)
+
+---
+ src/llama-graph.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0d7d356e2..a371c51a8 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2698,8 +2698,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
+     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+ 
+     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
+-    // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it
+-    const bool has_mixed = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
++    // Note: when running with a remote RPC head (or pure token batch without mixed inputs), creating the unused
++    // `inp_mixed_embd` and `node_1` branches forces `ggml_backend_sched` to ship two extra 14 KB embedding vectors
++    // per token (and 29 MB of zeros per 1024-token prompt) across TCP! Only build the mixed branch when `ubatch.is_mixed()`
++    // or when `GGML_KEEP_MIXED_BRANCH=1` is set.
++    const bool has_mixed = (ubatch.is_mixed() || getenv("GGML_KEEP_MIXED_BRANCH") != nullptr) &&
++                           llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+ 
+     const int64_t n_tok_rows = has_mixed ? llm_graph_n_tok_rows(ubatch) : 0;
+ 
+-- 
+2.55.0.windows.3
+

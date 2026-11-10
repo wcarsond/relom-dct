@@ -1,0 +1,9 @@
+Cap=22/128 (17.2%):
+  1. Single M: + LRU (per-layer):   38191 misses (84.79 GiB) | 102.3 ms/tok (  9.8 tok/s)
+  2. Dual C:+M: + Reddit + DCT:     28398 misses (63.05 GiB) |  31.8 ms/tok ( 31.4 tok/s) -> 3.22x faster!
+Cap=32/128 (25.0%):
+  1. Single M: + LRU (per-layer):   25568 misses (56.76 GiB) |  70.9 ms/tok ( 14.1 tok/s)
+  2. Dual C:+M: + Reddit + DCT:     19360 misses (42.98 GiB) |  22.1 ms/tok ( 45.2 tok/s) -> 3.21x faster!
+Cap=48/128 (37.5%):
+  1. Single M: + LRU (per-layer):    7682 misses (17.06 GiB) |  22.0 ms/tok ( 45.4 tok/s)
+  2. Dual C:+M: + Reddit + DCT:      7989 misses (17.74 GiB) |   9.6 ms/tok (104.0 tok/s) -> 2.29x faster!

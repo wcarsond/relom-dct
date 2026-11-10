@@ -1,0 +1,110 @@
+From b07c8510d9285f3e8b74c9aca2d3649dc34f0d5c Mon Sep 17 00:00:00 2001
+From: wcarsond <wcarsond@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 01:23:54 -0500
+Subject: [PATCH] q12h: prioritize top-4 largest outliers for exception slots
+ and snap sub-RELOM tail outliers
+
+When a 256-weight block has >16 distinct exponents and >4 outlier weights
+outside the top-16 LUT (e.g. in 80B/120B embedding and attention matrices
+where tiny near-zero weights < 2^-16 * block_max sit at the bottom of the
+distribution), sort outliers by magnitude so the 4 exact 16-bit exception
+slots always protect the 4 largest outliers, and snap any remaining tiny
+sub-RELOM tail outliers to their nearest LUT exponent instead of aborting.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ ggml/src/ggml-quants.c | 60 ++++++++++++++++++++++++++++++++----------
+ 1 file changed, 46 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index f507c15af..3de3bab4e 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -129,12 +129,13 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
+             continue;
+         }
+ 
+-        // top-16 exponents by count (count desc, value asc on ties: deterministic)
++        // top-16 exponents by count (count desc, value desc on ties so the largest
++        // magnitudes always claim LUT slots and only tiny sub-RELOM tail exponents overflow)
+         uint8_t inv[256];
+         memset(inv, 0xFF, sizeof(inv));
+         for (int s = 0; s < 16; s++) {
+             int best = -1;
+-            for (int e = 0; e < 256; e++) {
++            for (int e = 255; e >= 0; e--) {
+                 if (inv[e] != 0xFF || cnt[e] == 0) continue;
+                 if (best < 0 || cnt[e] > cnt[best]) best = e;
+             }
+@@ -148,25 +149,56 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
+         // lut[0] == 0xFF is the shift-mode marker, so a LUT block must never hold
+         // it. It only could for an inf/nan weight, which ggml rejects anyway.
+         GGML_ASSERT(y[i].lut[0] != Q12H_MODE_SHIFT && "q12h: inf/nan exponent in a LUT-mode block");
+-        int ne = 0;
+         for (int s = 0; s < 4; s++) { y[i].epos[s] = 0; y[i].eval[s] = Q12H_SLOT_EMPTY; }   // LUT-mode site (the second one; missed on the first pass)
++        // Collect all outlier indices not in top-16 LUT. If >4 outliers exist in a 256-weight
++        // block, give the 4 exact exception slots to the 4 LARGEST-magnitude outliers and snap
++        // any remaining tiny tail outliers (< 2^-16 * block_max, well below the RELOM horizon)
++        // to their nearest LUT exponent (or 0 if smaller than all LUT entries).
++        int outliers[QK12H];
++        int n_out = 0;
++        for (int j = 0; j < QK12H; j++) {
++            const uint8_t e = (bits[j] >> 7) & 0xFF;
++            if (inv[e] == 0xFF) outliers[n_out++] = j;
++        }
++        for (int a = 0; a < n_out - 1; a++) {
++            for (int b = a + 1; b < n_out; b++) {
++                if ((bits[outliers[b]] & 0x7FFF) > (bits[outliers[a]] & 0x7FFF)) {
++                    int tmp = outliers[a]; outliers[a] = outliers[b]; outliers[b] = tmp;
++                }
++            }
++        }
++        uint8_t is_exc[QK12H];
++        memset(is_exc, 0, sizeof(is_exc));
++        int ne = n_out < 4 ? n_out : 4;
++        for (int s = 0; s < ne; s++) {
++            int j = outliers[s];
++            GGML_ASSERT(bits[j] != Q12H_SLOT_EMPTY && "q12h: nan weight in an exception slot");
++            y[i].epos[s] = (uint8_t)j;
++            y[i].eval[s] = bits[j];
++            is_exc[j] = 1;
++        }
+         for (int j = 0; j < QK12H; j++) {
+             const uint8_t e  = (bits[j] >> 7) & 0xFF;
+             uint8_t       ix = inv[e];
+-            if (ix == 0xFF) {             // not in top-16: exception slot
+-                GGML_ASSERT(ne < 4 && "q12h: block needs >4 exception slots");
+-                // the empty-slot marker lives in the VALUE (0xFFFF, a NaN no weight can be), never in the
+-                // position byte: 0xFF there is a legal position (2026-10-31: 217 weights at position 255 of the
+-                // 14B came back with the wrong exponent because the old marker was epos == 0xFF)
+-                GGML_ASSERT(bits[j] != Q12H_SLOT_EMPTY && "q12h: nan weight in an exception slot");
+-                y[i].epos[ne] = (uint8_t)j;
+-                y[i].eval[ne] = bits[j];
+-                ne++;
+-                ix = 0;                   // nibble content is irrelevant here
++            uint8_t       sm = (uint8_t)((((bits[j] >> 15) & 1) << 7) | (bits[j] & 0x7F));
++            if (ix == 0xFF) {
++                if (is_exc[j]) {
++                    ix = 0;               // nibble content is irrelevant here (overridden by exception slot)
++                } else {
++                    // RELOM tail snap: find nearest LUT exponent (typically E=0 underflow)
++                    int best_s = 0, best_dist = 999;
++                    for (int s = 0; s < 16; s++) {
++                        int d = (int)e - (int)y[i].lut[s];
++                        if (d < 0) d = -d;
++                        if (d < best_dist) { best_dist = d; best_s = s; }
++                    }
++                    ix = (uint8_t)best_s;
++                    if (y[i].lut[best_s] == 0) sm &= 0x80; // clean zero mantissa if snapped to E=0
++                }
+             }
+             if (j & 1) y[i].nib[j >> 1] |= (uint8_t)(ix << 4);
+             else       y[i].nib[j >> 1]  = ix;
+-            y[i].sm[j] = (uint8_t)((((bits[j] >> 15) & 1) << 7) | (bits[j] & 0x7F));
++            y[i].sm[j] = sm;
+         }
+     }
+ }
+-- 
+2.55.0.windows.3
+

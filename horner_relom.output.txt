@@ -1,0 +1,18 @@
+=== Horner-Bucket + RELOM Zone-Stepped Matrix Multiply Proof (Qwen2.5-Coder-14B) ===
+
+1. Mode A — Lossless Exponent-Sorted Horner-Bucket (16 buckets/block, 0 per-weight shifts):
+   - Bit-exact bf16 match vs FP32 reference: 100.00% (128/128 rows)
+   - Max absolute float32 difference:        2.24e-08 (0.0 = mathematically identical!)
+   - Exponent header cost:                   16 bytes/block (0.50 bpw) vs 128 bytes (4.00 bpw) in unsorted nibbles!
+
+2. Mode B — RELOM 3-Zone Operand-Stepped Horner Dot Product (Switch Type ONCE per Zone!):
+   - Zone 1 (d=0..2, 8-bit INT8 significand):  46.2% of weights
+   - Zone 2 (d=3..5, 5-bit INT5 significand):  45.6% of weights
+   - Zone 3 (d=6..7, 3-bit INT3 significand):   6.1% of weights
+   - Zone 4 (d > 7,  0-bit RELOM skipped!):     2.2% of weights
+   - Average significand bits/weight:         6.15 bpw (down from 8.00 bpw)
+   - Exact bf16 output match:                 7.03%
+   - Within <= 1 ulp of FP32 reference:       16.41%
+   - Relative L2 error vs FP32 reference:     0.025303
+
+Done in 3.4 s.

@@ -1,0 +1,230 @@
+From f3c33cd74577c6426d8bb947fd66aa9f9dc10e1d Mon Sep 17 00:00:00 2001
+From: wcarsond <wcarsond@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:04:07 -0500
+Subject: [PATCH 1/4] q12h: move empty-slot sentinel to eval=0xFFFF, chunk
+ large Vulkan dequant dispatches, and fallback overflow tensors to BF16
+
+---
+ ggml/src/ggml-common.h                        |  5 ++
+ ggml/src/ggml-quants.c                        | 15 ++--
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 24 ++++++-
+ .../src/ggml-vulkan/vulkan-shaders/types.glsl |  4 +-
+ src/llama-quant.cpp                           | 69 ++++++++++++++++++-
+ 5 files changed, 106 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index 6bbd6e477..75c1abee7 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -211,6 +211,11 @@ static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 b
+ // block can never hold (ggml_validate_row_data rejects it), so a v1 file still
+ // decodes correctly under a v2 build.
+ #define Q12H_MODE_SHIFT 0xFF
++// An exception slot is empty when its VALUE is 0xFFFF (a NaN, which no weight can be: the validator rejects
++// inf/nan exception values). The position byte carries no marker, because a byte has no spare value and 255
++// is a legal position - the old epos == 0xFF marker silently mis-decoded every exception at position 255
++// (found 2026-10-31 on Qwen2.5-Coder-14B: 217 weights). Slots are filled in order, so the first empty ends the list.
++#define Q12H_SLOT_EMPTY 0xFFFF
+ #define QK12H 256
+ typedef struct {
+     uint8_t  lut[16];
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 168da6e5b..f507c15af 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -119,7 +119,7 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
+             y[i].lut[0] = Q12H_MODE_SHIFT;       // a LUT-mode block can never hold this
+             y[i].lut[1] = (uint8_t)emin;
+             for (int s = 2; s < 16; s++) y[i].lut[s] = 0;
+-            for (int s = 0; s < 4; s++) { y[i].epos[s] = 0xFF; y[i].eval[s] = 0; }
++            for (int s = 0; s < 4; s++) { y[i].epos[s] = 0; y[i].eval[s] = Q12H_SLOT_EMPTY; }
+             for (int j = 0; j < QK12H; j++) {
+                 const uint8_t off = (uint8_t)(((bits[j] >> 7) & 0xFF) - emin);
+                 if (j & 1) y[i].nib[j >> 1] |= (uint8_t)(off << 4);
+@@ -149,12 +149,16 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
+         // it. It only could for an inf/nan weight, which ggml rejects anyway.
+         GGML_ASSERT(y[i].lut[0] != Q12H_MODE_SHIFT && "q12h: inf/nan exponent in a LUT-mode block");
+         int ne = 0;
+-        for (int s = 0; s < 4; s++) { y[i].epos[s] = 0xFF; y[i].eval[s] = 0; }
++        for (int s = 0; s < 4; s++) { y[i].epos[s] = 0; y[i].eval[s] = Q12H_SLOT_EMPTY; }   // LUT-mode site (the second one; missed on the first pass)
+         for (int j = 0; j < QK12H; j++) {
+             const uint8_t e  = (bits[j] >> 7) & 0xFF;
+             uint8_t       ix = inv[e];
+             if (ix == 0xFF) {             // not in top-16: exception slot
+                 GGML_ASSERT(ne < 4 && "q12h: block needs >4 exception slots");
++                // the empty-slot marker lives in the VALUE (0xFFFF, a NaN no weight can be), never in the
++                // position byte: 0xFF there is a legal position (2026-10-31: 217 weights at position 255 of the
++                // 14B came back with the wrong exponent because the old marker was epos == 0xFF)
++                GGML_ASSERT(bits[j] != Q12H_SLOT_EMPTY && "q12h: nan weight in an exception slot");
+                 y[i].epos[ne] = (uint8_t)j;
+                 y[i].eval[ne] = bits[j];
+                 ne++;
+@@ -191,9 +195,10 @@ void dequantize_row_q12h(const block_q12h * GGML_RESTRICT x, float * GGML_RESTRI
+             memcpy(&y[i*QK12H + j], &u, sizeof(float));
+         }
+         for (int s = 0; s < 4; s++) {
++            const uint16_t v = x[i].eval[s];
++            if (v == Q12H_SLOT_EMPTY) break;   // slots are filled in order; the marker is in the value
+             const uint8_t p = x[i].epos[s];
+-            if (p == 0xFF) break;
+-            const uint32_t u = (uint32_t)x[i].eval[s] << 16;
++            const uint32_t u = (uint32_t)v << 16;
+             memcpy(&y[i*QK12H + p], &u, sizeof(float));
+         }
+     }
+@@ -5673,7 +5678,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+                         }
+                     }
+                     for (int s = 0; s < 4; ++s) {
+-                        if (q[i].epos[s] == 0xFF) {
++                        if (q[i].eval[s] == Q12H_SLOT_EMPTY) {
+                             break;
+                         }
+                         if (((q[i].eval[s] >> 7) & 0xFF) == 0xFF) {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a6bb45d6f..16696b5be 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6645,7 +6645,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+ 
+         // Request descriptor sets
+         if (qx_needs_dequant) {
+-            ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
++            // one set per dequant chunk (see the chunked dispatch below; 1 for every tensor that fits one dispatch)
++            const uint64_t max_x = (uint64_t)ctx->device->properties.limits.maxComputeWorkGroupCount[0] * to_fp16_vk_0->wg_denoms[0];
++            const uint64_t chunk = (max_x / 16384) * 16384;
++            ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, (uint32_t)CEIL_DIV((uint64_t)x_ne, chunk));
+         }
+         if (qy_needs_dequant) {
+             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_1, 1);
+@@ -6705,8 +6708,23 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+     if (x_non_contig) {
+         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0));
+     } else if (qx_needs_dequant) {
+-        const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
+-        ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)(x_ne), 1, 1});
++        // One dispatch covers at most maxComputeWorkGroupCount[0] * wg_denoms[0] elements (65535 x 8192 on Intel).
++        // Q12H has no MMQ path, so a prompt-phase matmul dequantizes the WHOLE weight tensor here, and a big
++        // output.weight (Qwen2.5-14B: 778M weights) is more than that: the 14B KL run tripped the assert in
++        // ggml-vulkan-common.h at every batch size (2026-10-31). So: chunk by 16384-element steps (64 blocks =
++        // 26368 bytes, a multiple of every storage-buffer offset alignment), shifting both buffers; a tensor that
++        // fits takes the single dispatch it always took. The shader bounds itself with p.nel per chunk.
++        const uint64_t max_x = (uint64_t)ctx->device->properties.limits.maxComputeWorkGroupCount[0] * to_fp16_vk_0->wg_denoms[0];
++        const uint64_t chunk = (max_x / 16384) * 16384;
++        const uint64_t blk   = ggml_blck_size(src0->type);
++        const uint64_t blkb  = ggml_type_size(src0->type);
++        for (uint64_t base = 0; base < (uint64_t)x_ne; base += chunk) {
++            const uint32_t n = (uint32_t)std::min<uint64_t>(chunk, (uint64_t)x_ne - base);
++            const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, n };
++            ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0,
++                { vk_subbuffer{ d_Qx, qx_buf_offset + base / blk * blkb, (uint64_t)n / blk * blkb },
++                  vk_subbuffer{ d_X, base * sizeof(ggml_fp16_t), (uint64_t)n * sizeof(ggml_fp16_t) } }, pc, { n, 1, 1});
++        }
+         ggml_vk_sync_buffers(ctx, subctx);
+     }
+     if (y_needs_reformat) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+index e8f0b2307..6236c0750 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+@@ -1872,8 +1872,8 @@ struct block_nvfp4_packed32
+ 
+ // Q12H: lossless 12.875-bit storage for bf16 weights. 256 weights / 412 bytes.
+ // lut[16]  - the block's 16 most frequent bf16 exponent bytes
+-// epos[4]  - exception positions (0..255), 0xFF = empty slot (and all later slots empty)
+-// eval[4]  - exception values, raw bf16 bit patterns
++// epos[4]  - exception positions (0..255, every value legal; no marker lives here)
++// eval[4]  - exception values, raw bf16 bit patterns; 0xFFFF (a NaN) = empty slot, and all later slots empty
+ // nib[128] - 4-bit lut indices, two per byte, EVEN index in the LOW nibble
+ // sm[256]  - sign(1) << 7 | mantissa(7)
+ #define QUANT_K_Q12H 256
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 6d7b26785..f2e78db3a 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -1270,7 +1270,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+                ggml_type_name(tensor->type));
+ 
+         const ggml_type cur_type = tensor->type;
+-        const ggml_type new_type = tm.target_type;
++        ggml_type new_type = tm.target_type;   // not const: the Q12H pre-pass below may fall back to BF16
+ 
+         // If we've decided to quantize to the same type the tensor is already
+         // in then there's nothing to do.
+@@ -1346,6 +1346,73 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
+                 }
+ 
++                // Q12H is lossless by construction, but a 256-weight block can only express 16 distinct exponents plus
++                // 4 exceptions; a block that needs more trips GGML_ASSERT in quantize_row_q12h_ref. A lossless format
++                // must degrade to 1.0x on such input, never abort or lose a bit, so such a tensor stays BF16 (the
++                // 2026-10-31 Qwen2.5-Coder-14B pack died on blk.1.attn_q.weight). Pre-pass over the tensor's rows.
++                if (new_type == GGML_TYPE_Q12H) {
++                    int64_t n_over = 0, n_blocks = 0;
++                    const int64_t n_per_row = tensor->ne[0];
++                    if (n_per_row % 256 != 0) {
++                        n_over = -1;
++                    } else {
++                        const int64_t nrows_total = ggml_nrows(tensor);
++                        const size_t  row_size_src = ggml_row_size(tensor->type, n_per_row);
++                        const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/(row_size_src + n_per_row*sizeof(float))));
++                        for (int64_t ir = 0; ir < nrows_total; ir += nrows_slab) {
++                            const int64_t nrows_cur = std::min(nrows_slab, nrows_total - ir);
++                            const int64_t nelements_cur = nrows_cur * n_per_row;
++                            const void * src = load_range(ir*row_size_src, nrows_cur*row_size_src);
++                            const float * f32;
++                            if (tensor->type == GGML_TYPE_F32) {
++                                f32 = (const float *) src;
++                            } else {
++                                if (f32_conv_buf.size() < (size_t) nelements_cur) {
++                                    f32_conv_buf.resize(nelements_cur);
++                                }
++                                llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
++                                f32 = (const float *) f32_conv_buf.data();
++                            }
++                            for (int64_t b = 0; b < nelements_cur / 256; b++) {
++                                const float * x = f32 + b*256;
++                                int cnt[256] = { 0 };
++                                int emin = 255, emax = 0;
++                                for (int j = 0; j < 256; j++) {
++                                    uint32_t u; memcpy(&u, &x[j], sizeof(u));
++                                    const int e = (int) (((u + 0x7FFF + ((u >> 16) & 1)) >> 23) & 0xFF);   // bf16 exponent after RNE
++                                    cnt[e]++;
++                                    if (e < emin) emin = e;
++                                    if (e > emax) emax = e;
++                                }
++                                n_blocks++;
++                                if (emax - emin <= 15 && emin >= 8 && emax <= 254) {
++                                    continue;                                    // shift mode
++                                }
++                                int top16 = 0;                                   // LUT mode: sum of the 16 biggest counts
++                                for (int s = 0; s < 16; s++) {
++                                    int best = -1;
++                                    for (int e = 0; e < 256; e++) {
++                                        if (cnt[e] > 0 && (best < 0 || cnt[e] > cnt[best])) best = e;
++                                    }
++                                    if (best < 0) break;
++                                    top16 += cnt[best];
++                                    cnt[best] = 0;
++                                }
++                                if (256 - top16 > 4) n_over++;
++                            }
++                        }
++                    }
++                    if (n_over != 0) {
++                        if (n_over < 0) {
++                            LLAMA_LOG_INFO("q12h: ne[0] = %" PRId64 " is not a multiple of 256, keeping bf16 .. ", n_per_row);
++                        } else {
++                            LLAMA_LOG_INFO("q12h: %" PRId64 " of %" PRId64 " blocks need more than 16 exponents + 4 exceptions, keeping bf16 .. ", n_over, n_blocks);
++                        }
++                        new_type = GGML_TYPE_BF16;
++                        qs.n_fallback++;
++                    }
++                }
++
+                 LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
+                 fflush(stdout);
+ 
+-- 
+2.55.0.windows.3
+
