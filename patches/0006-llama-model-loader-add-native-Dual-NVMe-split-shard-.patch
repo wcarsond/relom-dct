@@ -1,0 +1,54 @@
+From 114e8bc19b7b37d5e8d63fe7b5fb958afaacdf98 Mon Sep 17 00:00:00 2001
+From: wcarsond <wcarsond@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:14:48 -0500
+Subject: [PATCH] llama-model-loader: add native Dual-NVMe split-shard fallback
+ across C:\models-stripe and M:
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ src/llama-model-loader.cpp | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 62063cae3..872ffedcc 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -626,13 +626,34 @@ llama_model_loader::llama_model_loader(
+ 
+             // load other splits
+             for (idx = 1; idx < n_split; idx++) {
+-                const char * fname_split = splits[idx].c_str();
++                std::string fname_split_str = splits[idx];
++                const char * fname_split = fname_split_str.c_str();
+ 
+                 struct gguf_init_params split_params = {
+                     /*.no_alloc = */ true,
+                     /*.ctx      = */ &ctx,
+                 };
+                 gguf_context_ptr ctx_gguf { gguf_init_from_file(fname_split, split_params) };
++                if (!ctx_gguf) {
++                    // Dual-NVMe Stripe Fallback: if a split shard is not in the primary folder,
++                    // check LLAMA_STRIPE_DIR (or C:\models-stripe\<subdir>\<basename>) so multi-shard
++                    // models can be striped across C: (CPU-direct NVMe) and M: (PCH NVMe) without symlinks!
++                    const char * stripe_env = getenv("LLAMA_STRIPE_DIR");
++                    size_t sep = fname_split_str.find_last_of("/\\");
++                    std::string base_name = (sep == std::string::npos) ? fname_split_str : fname_split_str.substr(sep + 1);
++                    std::string parent_dir = (sep == std::string::npos) ? "" : fname_split_str.substr(0, sep);
++                    size_t sep2 = parent_dir.find_last_of("/\\");
++                    std::string model_subdir = (sep2 == std::string::npos) ? parent_dir : parent_dir.substr(sep2 + 1);
++                    std::string alt_path = stripe_env
++                        ? (std::string(stripe_env) + "\\" + base_name)
++                        : ("C:\\models-stripe\\" + model_subdir + "\\" + base_name);
++                    ctx_gguf.reset(gguf_init_from_file(alt_path.c_str(), split_params));
++                    if (ctx_gguf) {
++                        LLAMA_LOG_INFO("%s: Dual-NVMe stripe loaded shard %d from %s\n", __func__, idx, alt_path.c_str());
++                        fname_split_str = alt_path;
++                        fname_split = fname_split_str.c_str();
++                    }
++                }
+                 if (!ctx_gguf) {
+                     throw std::runtime_error(format("%s: failed to load GGUF split from %s", __func__, fname_split));
+                 }
+-- 
+2.55.0.windows.3
+
