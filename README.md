@@ -47,16 +47,16 @@ To avoid over-claiming or reinventing textbook terms, here is the exact line bet
        - `Gemma-4-26B-A4B` (`25.2B`, `15.83 GiB`): **`30.14 tok/s`** (`657.5 tok/s` prefill)
        - `Qwen3-Coder-30B-A3B` (`30.5B`, `16.45 GiB`): **`27.85 tok/s`** (`543.4 tok/s` prefill)
        - `Qwen3.6-35B-A3B` (`34.7B`, `20.81 GiB`): **`32.83 tok/s`** (`569.3 tok/s` prefill)
-       - `Qwen3-Coder-Next 80B-A3B` (`79.7B`, `46.20 GiB`): **`25.96 tok/s`** (`320.7 tok/s` prefill) — and **`9.22 tok/s` on the integrated Intel iGPU alone (`0` discrete GPUs)**!
+       - `Qwen3-Coder-Next 80B-A3B` (`79.7B`, `46.20 GiB`): **`25.96 tok/s`** (`320.7 tok/s` prefill) at `-ncmoe 48`, **`9.22 tok/s` on the integrated Intel iGPU alone (`0` discrete GPUs)**, and **`58.18 tok/s` (`935.8 tok/s` prefill)** at `-ncmoe 2 -ts 24/24` (or **`50.33 tok/s`** on `Qwen3-Coder-Next-QL-Backbone-Q4_K_XL.gguf` `46.91 GiB` at `-ncmoe 4 -ts 25/23`).
        - `gpt-oss-120b` (`116.8B`, `59.02 GiB`): **`18.74 tok/s`** (`144.0 tok/s` prefill) at `-ncmoe 36`, and **`40.27 tok/s` (`524.3 tok/s` prefill)** at `-ncmoe 9 -ts 22/14` (or **`36.18 tok/s` @ `d=0`, `35.98 tok/s` @ `d=4K`, `33.76 tok/s` @ `d=16K`, `31.56 tok/s` @ `d=32K`** at deep-safe `-ncmoe 12 -ts 24/12 -fa 1`).
-       - `DeepSeek-V4-Flash-0731` (**`284.3B`**, `80.76 GiB`, `43 layers`, `256 experts`, `6 active`): **`171.76 tok/s` prefill and `13.72 tok/s` decode** at `-ncmoe 24 -ts 31/12 -lm none` (`19` MoE layers + `8.20 GiB` Backbone in B60 VRAM, `24` MoE layers = `40.5 GiB` in DDR5-6000 RAM, `0` SSD paging!).
-       - `GLM-5.3-Flash` (**`320.8B`**, `94.84 GiB`, `46 layers`, `288 experts`, `8 active = 18B active`): Striped across both NVMe drives (`Shard 2` `46.47 GiB` on CPU-direct NVMe `C:` + `Shards 1, 3, 4` `48.37 GiB` on PCH NVMe `M:` via native Dual-NVMe split-shard loader in `llama-model-loader.cpp`), running at **`32.71 tok/s` prefill and `9.45 tok/s` decode** (`-ncmoe 28 -ts 31/15 -lm mmap`).
+       - `DeepSeek-V4-Flash-0731` (**`284.3B`**, `80.76 GiB`, `43 layers`, `256 experts`, `6 active`): **`179.65 tok/s` prefill and `15.06 tok/s` decode** at `-ncmoe 22 -ts 31/12 -lm none` (`21` MoE layers + `8.20 GiB` Backbone in B60 VRAM, `22` MoE layers = `37.1 GiB` in DDR5-6000 RAM, `0` SSD paging!).
+       - `GLM-5.3-Flash` (**`320.8B`**, `94.84 GiB`, `46 layers`, `288 experts`, `8 active = 18B active`): Striped across both NVMe drives (`Shard 2` `46.47 GiB` on CPU-direct NVMe `C:` + `Shards 1, 3, 4` `48.37 GiB` on PCH NVMe `M:` via native Dual-NVMe split-shard loader in `llama-model-loader.cpp`), running at **`38.55 tok/s` prefill and `9.64 tok/s` decode** (`-ncmoe 28 -ts 31/15 -lm mmap`).
      - **Standalone 8 GB NVIDIA RTX 3070 + 32 GB DDR4-2667 (`Qwen3-Coder-30B-A3B`, `16.45 GiB`):**
        - Runs a `30.5B` model on a single 8 GB card at **`829.7 tok/s` prefill and `26.55–28.36 tok/s` decode** (`-ncmoe 32..28`), tapering cleanly to **`17.60 tok/s` (`677.6 tok/s` prefill)** with 100% of experts in DDR4 (`-ncmoe 48`, `1.80 GiB` VRAM).
 5. **Dual-Clutch Transmission (DCT) + Asymmetric Dual-Channel NVMe (`C: + M:`) + Reddit & Reloaded Score for MoE:**
    - **Asymmetric 2:1 NVMe Striping:** Striping expert records 2:1 across CPU-direct NVMe `C:` (`6.32 GiB/s`) and Chipset NVMe `M:` (`3.23–3.73 GiB/s`) reaches **`9.23–9.61 GiB/s` (`10.3 GB/s`)**.
    - **Reddit Score + `Reloaded Score` (Speculative Unloading of "Abstract Tourists"):** Preserves per-expert frequency/recency across evictions and tracks `reloaded_score` (regret reloads within $\le 32$ steps) while unloading one-shot "abstract tourist" experts first, cutting SSD misses by **12–24%** and eliminating thousands of regret reloads on 3,206-token traces.
-   - **DCT GPU+CPU Split Overlap (`ggml-backend.cpp`):** Fires the GPU's resident expert subgraph (`out_hit`) asynchronously *before* starting the CPU's missed-expert subgraph (`out_miss`), and overlaps multi-layer lookahead NVMe reads (`3.22×` end-to-end NVMe tier speedup in `dct_nvme_race.py`).
+   - **DCT GPU+CPU Split Overlap & Shared-Expert First Ordering (`ggml-backend.cpp`, `qwen3next.cpp`, `deepseek4.cpp`, `glm5-next.cpp`):** Building the GPU-resident Shared Expert (`ffn_shexp`) *before* the CPU-offloaded Routed Experts (`moe_out`) fuses `ffn_shexp` into the GPU's Attention split and eliminates an extra `GPU -> CPU -> GPU` split transition per offloaded layer, boosting `Qwen3-Coder-Next 80B` from `54.14 -> 58.18 tok/s` (`45.65 -> 50.33 tok/s` on `80B QL-Backbone`) and `DeepSeek-V4-Flash 284B` from `14.43 -> 15.06 tok/s`.
 6. **Distributed RPC Head Fix & On-the-Fly `Q12H` Wire Compression (`ggml-rpc.cpp` + `llama-graph.cpp`):**
    - Eliminated two unused `has_mixed` embedding input branches on pure token batches in `llama-graph.cpp` (`-95%` incoming wire bytes to an RPC head stage: `45.2 KiB -> 2.3 KiB/token`).
    - Added live `Q12H` wire compression for `F32` activation tensors in `ggml-rpc.cpp` (`SET_TENSOR` and `GET_TENSOR`, `2.49×` smaller on the wire: `14.00 KiB -> 5.63 KiB`). **This is lossy and opt-in (`GGML_RPC_WIRE_Q12H=1`, off by default, RPC protocol `8.0.2`):** activations are cut from `F32` to 16 bits and outliers beyond a block's 4 exception slots are snapped. Measured on the 30B `QL+Q8` across `RTX 3070 + 2× B60`: wire on against wire off = mean KLD `0.000971`, same top token `99.098%` (off against off repeats exactly: KLD `0`, `100%`); against `BF16`, off = `0.001632` / `98.870%`, on = `0.001707` / `98.729%`. It made no tok/s difference on 10 GbE.
@@ -71,13 +71,14 @@ To avoid over-claiming or reinventing textbook terms, here is the exact line bet
 - `ramoe_dct.py` / `dct_nvme_race.py` / `dct_nvme_race.output.txt` — Dual-Channel NVMe (2:1 `C: + M:`) + Reddit Score + DCT lookahead engine and benchmark on `Qwen3-30B-A3B` routing trace.
 - `surgical_ql_80b.py` / `surgical_ql_120b.py` — Surgical HTTP `Range` `BF16 -> QL (Q12H) / BF16` Backbone transplant scripts for `Qwen3-Coder-Next 80B-A3B` and `gpt-oss-120b`.
 - `npu_router_switchman.py` — OpenVINO MoE Router Gate offload across all 48 layers onto the Intel AI Boost NPU and Arrow Lake iGPU.
-- `patches/` — The 6 commits on top of `llama.cpp` (`q12h-moe` branch):
+- `patches/` — The 7 commits on top of `llama.cpp` (`q12h-moe` branch):
   - `0001` — `Q12H_SLOT_EMPTY = 0xFFFF` sentinel fix, chunked Vulkan dequant dispatch, `BF16` overflow fallback.
   - `0002` — AVX2 `Q12H` CPU dot product (`+63%` decode), direct IEEE-754 bit-shift `Q12H` Vulkan shader, Reddit-score MoE cache with profile prewarm, and DCT GPU+CPU split overlap.
   - `0003` — Skip unused `has_mixed` embedding branches on pure token batches (`-95%` RPC head wire traffic).
-  - `0004` — Live `Q12H` wire compression for `F32` activations in `ggml-rpc.cpp` (`2.49×` smaller wire payload).
-  - `0005` — Prioritize top-4 largest outliers for `Q12H` 16-bit exception slots and snap sub-`RELOM` tail outliers.
+  - `0004` — Opt-in `Q12H` wire compression for `F32` activations in `ggml-rpc.cpp` (`GGML_RPC_WIRE_Q12H=1`, RPC protocol `8.0.2`).
+  - `0005` — Prioritize top-4 largest outliers for `Q12H` 16-bit exception slots, enforce strict lossless `quantize_q12h`, and assert 256-weight row alignment.
   - `0006` — Native Dual-NVMe split-shard loader (`llama-model-loader.cpp`) for striping multi-shard `95+ GiB` GGUFs across `C:` and `M:` without cross-volume symlinks.
+  - `0007` — Shared-Expert-First graph ordering (`qwen3next.cpp`, `deepseek4.cpp`, `glm5-next.cpp`), generalized DCT `GPU+CPU` split overlap (`ggml-backend.cpp`), and Two-Tier `PP-Flush / TG Objective-Lock` + Zero-Stall Shadow Coaster (`llama-moe-cache.cpp`).
 
 ---
 

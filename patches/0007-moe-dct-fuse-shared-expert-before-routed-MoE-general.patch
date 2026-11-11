@@ -1,0 +1,513 @@
+From b63541d64bc45bf1f08cc568b48678a9f3fec92e Mon Sep 17 00:00:00 2001
+From: wcarsond <wcarsond@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:19:06 -0500
+Subject: [PATCH] moe-dct: fuse shared expert before routed MoE, generalize DCT
+ overlap, and add PP-Flush + TG Objective-Lock
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ ggml/src/ggml-backend.cpp |  12 +--
+ src/llama-context.cpp     |   3 +
+ src/llama-moe-cache.cpp   | 188 ++++++++++++++++++++++++++++++++++----
+ src/llama-moe-cache.h     |   3 +
+ src/models/deepseek4.cpp  |  18 ++--
+ src/models/glm5-next.cpp  |  15 +--
+ src/models/qwen3next.cpp  |  50 +++++-----
+ 7 files changed, 228 insertions(+), 61 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 0b7028bd3..f17313d7c 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1928,9 +1928,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             }
+                         }
+                     }
+-                    if (max_prod == 0) {
+-                        // 1. Run node 0 (`ffn_moe_misses` GET_ROWS) on GPU
+-                        struct ggml_cgraph gv_head = ggml_graph_view(&split->graph, 0, 1);
++                    if (max_prod >= 0 && max_prod < split->graph.n_nodes - 3) {
++                        // 1. Run nodes `0..max_prod` (e.g. `ffn_norm` + router gate before `ffn_shexp`) on GPU
++                        struct ggml_cgraph gv_head = ggml_graph_view(&split->graph, 0, max_prod + 1);
+                         enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv_head);
+                         if (ec != GGML_STATUS_SUCCESS) {
+                             return ec;
+@@ -1938,7 +1938,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+                         }
+-                        // 2. Copy the small inputs (`ffn_norm` + `ffn_moe_misses`) to the CPU now (waits only for `gv_head`)
++                        // 2. Copy the small inputs (`ffn_norm` + `selected_experts`) to the CPU now (waits only for `gv_head`)
+                         for (int inp_i = 0; inp_i < next_split->n_inputs; inp_i++) {
+                             if (!ggml_backend_sched_is_host_weight(next_split->inputs[inp_i])) {
+                                 ggml_backend_sched_copy_input(sched, next_split, next_split->inputs[inp_i]);
+@@ -1949,8 +1949,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                                 ggml_backend_sched_copy_input(sched, next_split, next_split->inputs[inp_i]);
+                             }
+                         }
+-                        // 3. Launch `gv_tail` (`out_hit` on GPU) asynchronously!
+-                        struct ggml_cgraph gv_tail = ggml_graph_view(&split->graph, 1, split->graph.n_nodes);
++                        // 3. Launch `gv_tail` (`ffn_shexp` / `out_hit` on GPU) asynchronously!
++                        struct ggml_cgraph gv_tail = ggml_graph_view(&split->graph, max_prod + 1, split->graph.n_nodes);
+                         ec = ggml_backend_graph_compute_async(split_backend, &gv_tail);
+                         if (ec != GGML_STATUS_SUCCESS) {
+                             return ec;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 542b13ff8..e975b5cfb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2820,6 +2820,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         }
+ 
+         st.ids = ids;
++        if (lctx->moe_cache) {
++            lctx->moe_cache->record_pp_experts(src, st.ids_data.data(), st.ids_data.size());
++        }
+     }
+ 
+     // group consecutive experts and copy them together
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 51b2a907e..49e25d224 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -34,12 +34,13 @@ struct moe_cache_slru {
+     std::vector<bool> is_protected;
+     int32_t n_protected = 0;
+ 
+-    // Reddit-style frequency + hotness scoring and Dual-Clutch Transmission (DCT) state for split mode:
+-    // Every expert across all layers keeps a decayed frequency score + recency timestamp, even when not resident.
+-    // In DCT split mode, when a missed expert's Reddit score beats the coldest resident slot, it is uploaded into the
+-    // background clutch slot (`clutch_b`: slot `n_slots`) while the CPU computes the current token's miss without
+-    // stalling on the upload. On the next token, `clutch_b` swaps with the victim slot in O(1) pointer time!
+-    std::vector<float>   freq_score; // [n_layer * n_expert]
++    // Two-Tier Dimter / Reddit Scoring (`obj_score` + `freq_score`):
++    //   1. `obj_score` (Job Objective Gravity): Builds during TG generation (+0.25/hit) and NEVER decays
++    //      within a job, keeping the session's core Kicker_Group tools bolted on the saw across tangents.
++    //   2. `freq_score` (Fast Knot / Tangent Kicker): Decays fast (0.85 every 32 steps) and is FLUSHED at the
++    //      PP -> TG boundary so PP-only "Reader" experts (`Rank 1`) get kicked off as soon as TG starts!
++    std::vector<float>   obj_score;  // [n_layer * n_expert] non-decaying TG objective anchor
++    std::vector<float>   freq_score; // [n_layer * n_expert] fast-decaying short-window frequency
+     std::vector<int32_t> last_used;  // [n_layer * n_expert]
+     int32_t              step_clock = 0;
+ 
+@@ -56,6 +57,15 @@ struct moe_cache_slru {
+     uint32_t seen_gen = 0;
+     std::vector<int32_t> uniq;
+ 
++    // PP -> TG Dimter Tooling-List Handoff:
++    // During large-batch prompt prefill (`PP`, via `sched_copy_experts`), record how many times each
++    // expert fires in `pp_counts[il * n_expert + e]` without touching the VRAM cache during PP.
++    // Then, on the very first single-token generation step (`TG`), `needs_pp_handoff` triggers a
++    // one-shot bulk upload of the prompt's Top-K Superset ("Kicker Group Tooling List") into VRAM,
++    // and FLUSHES `freq_score` so Rank-1 (PP-only) readers are immediately evicted if they don't fire in TG!
++    std::vector<int32_t> pp_counts;
++    bool                 needs_pp_handoff = false;
++
+     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
+         this->n_expert = n_expert;
+         this->n_slots  = n_slots;
+@@ -72,8 +82,11 @@ struct moe_cache_slru {
+         tail[0] = n_slots - 1;
+         is_protected.assign(n_slots, false);
+         seen.assign(n_expert, 0);
++        obj_score.assign((size_t)n_layer * n_expert, 0.0f);
+         freq_score.assign((size_t)n_layer * n_expert, 0.0f);
+         last_used.assign((size_t)n_layer * n_expert, -1000);
++        pp_counts.assign((size_t)n_layer * n_expert, 0);
++        needs_pp_handoff = false;
+         step_clock = 0;
+         pending_clutch = {};
+     }
+@@ -81,8 +94,8 @@ struct moe_cache_slru {
+     float reddit_score(int32_t il, int32_t e) const {
+         const size_t idx = (size_t)il * n_expert + e;
+         const int32_t age = step_clock - last_used[idx];
+-        const float hot_bonus = (age <= 12) ? (2.5f / (1.0f + 0.1f * (float)std::max(0, age))) : 0.0f;
+-        return freq_score[idx] + hot_bonus;
++        const float hot_bonus = (age <= 8) ? (2.0f / (1.0f + 0.15f * (float)std::max(0, age))) : 0.0f;
++        return obj_score[idx] + freq_score[idx] + hot_bonus;
+     }
+ 
+     // move slot s to the most recently used end of a segment
+@@ -187,10 +200,10 @@ struct moe_cache_slru {
+         n_hit  = 0;
+         n_miss = 0;
+ 
+-        // Periodic Reddit gravity decay every 64 layer calls
+-        if (++step_clock % 64 == 0) {
++        // Fast Knot/Tangent Kicker decay every 32 layer calls (while `obj_score` never decays!)
++        if (++step_clock % 32 == 0) {
+             for (float & f : freq_score) {
+-                f *= 0.90f;
++                f *= 0.85f;
+             }
+         }
+ 
+@@ -228,10 +241,11 @@ struct moe_cache_slru {
+ 
+         int32_t * slots = slot_map[il];
+ 
+-        // Update Reddit frequency & recency scores for all requested experts, and promote hits
++        // Update Two-Tier Dimter/Reddit scores (`obj_score` + `freq_score`) for all requested TG experts
+         for (int32_t e : uniq) {
+             const size_t idx = (size_t)il * n_expert + e;
+-            freq_score[idx] += 1.0f;
++            obj_score[idx]  += 0.25f; // Permanent TG Objective Gravity ("Kicker Group stays on the saw!")
++            freq_score[idx] += 1.0f;  // Fast-decaying short-window score
+             last_used[idx]   = step_clock;
+             if (slots[e] >= 0) {
+                 touch(slots[e]);
+@@ -349,6 +363,8 @@ struct llama_moe_cache::impl {
+         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+         ggml_tensor * cpu_map = nullptr;    // I32 [1, n_expert] in host memory, split mode only
+         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
++        std::vector<int32_t> shadow_ids;    // async shadow buffer populated on token t, read on token t+1 with ZERO GPU synchronize!
++        bool has_shadow = false;
+     };
+ 
+     struct binding {
+@@ -488,10 +504,24 @@ struct llama_moe_cache::impl {
+         size_t n_tensors_host = 0;
+         for (group & g : groups) {
+             const device & d = devices[g.id];
++            const size_t max_buf = ggml_backend_buft_get_max_size(d.buft);
+             const int32_t n_expert  = g.ref[0]->ne[2];
+             const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
+             const int32_t max_slots = g.layers.size()*n_expert;
+-            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
++            auto fits_device_limits = [&](int32_t cand_slots) {
++                if (alloc_size(g, cand_slots) > budget) {
++                    return false;
++                }
++                if (max_buf > 0 && max_buf < SIZE_MAX) {
++                    for (const ggml_tensor * t : g.ref) {
++                        if ((size_t)t->nb[2] * (size_t)(cand_slots + 1) > max_buf) {
++                            return false;
++                        }
++                    }
++                }
++                return true;
++            };
++            while (g.n_slots < max_slots && fits_device_limits(g.n_slots + 1)) {
+                 g.n_slots++;
+             }
+             if (g.n_slots < n_expert_used) {
+@@ -710,13 +740,34 @@ struct llama_moe_cache::impl {
+         return n;
+     }
+ 
++    void record_pp_experts(const ggml_tensor * w, const int32_t * ids_data, size_t n_ids) {
++        const auto it = bindings.find(w);
++        if (it == bindings.end() || it->second.ip != 0) {
++            return; // only tally once per layer (on bank 0)
++        }
++        const int32_t il = it->second.il;
++        if (il < 0 || il >= (int32_t)layers.size() || layers[il].ig < 0) {
++            return;
++        }
++        group & g = groups[layers[il].ig];
++        const int32_t n_exp = g.slru.n_expert;
++        for (size_t i = 0; i < n_ids; ++i) {
++            const int32_t e = ids_data[i];
++            if (e >= 0 && e < n_exp) {
++                g.slru.pp_counts[(size_t)il * n_exp + e]++;
++                g.slru.freq_score[(size_t)il * n_exp + e] += 1.0f;
++            }
++        }
++        g.slru.needs_pp_handoff = true;
++    }
++
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+         const auto it = layer_of.find(src);
+         if (it == layer_of.end()) {
+             return false;
+         }
+         const int32_t il = it->second;
+-        const layer & l = layers[il];
++        layer & l = layers[il];
+         group & g = groups[l.ig];
+ 
+         GGML_ASSERT(backend == devices[g.id].backend);
+@@ -736,9 +787,75 @@ struct llama_moe_cache::impl {
+         // measured ~5 ms/token of uploads against ~24 ms/token of stalling, 48 times per token.
+         // The hit rate logged at the end therefore covers the warm-up only; after the freeze the
+         // split is static and its hit rate is whatever the warm-up happened to leave resident.
++        // PP -> TG Dimter Tooling-List Handoff:
++        // If the Roughing Pass (`PP`, large prompt batch) just ran and recorded its expert usage into `pp_counts`,
++        // immediately pack the VRAM cache with the Prompt's Top-K Superset ("Kicker Group Tooling List") in one
++        // merged burst before Token #1 of `TG` executes — with ZERO `ggml_backend_synchronize` stalls!
++        if (split && g.slru.needs_pp_handoff) {
++            g.slru.needs_pp_handoff = false;
++            struct cand { int32_t count; int32_t il; int32_t e; };
++            std::vector<cand> cands;
++            for (int32_t gil : g.layers) {
++                for (int32_t e = 0; e < g.slru.n_expert; ++e) {
++                    const int32_t c = g.slru.pp_counts[(size_t)gil * g.slru.n_expert + e];
++                    if (c > 0 && g.slru.slot_map[gil][e] < 0) {
++                        cands.push_back({ c, gil, e });
++                    }
++                }
++            }
++            std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.count > b.count; });
++            // Fill all remaining empty slots first; if already full, replace up to 1/3 coldest unpinned slots
++            int32_t uploaded = 0;
++            for (size_t k = 0; k < cands.size(); ++k) {
++                const int32_t cil = cands[k].il;
++                const int32_t ce  = cands[k].e;
++                int32_t s = g.slru.empty_slot();
++                if (s < 0) {
++                    if (uploaded >= std::max(1, g.n_slots / 3)) {
++                        break;
++                    }
++                    s = g.slru.victim(cil);
++                    if (s < 0) break;
++                    const int32_t old_key = g.slru.key_of[s];
++                    if (old_key >= 0) {
++                        if (g.slru.reddit_score(cil, ce) <= g.slru.reddit_score(old_key / g.slru.n_expert, old_key % g.slru.n_expert)) {
++                            break;
++                        }
++                        g.slru.set_resident(old_key / g.slru.n_expert, old_key % g.slru.n_expert, -1);
++                    }
++                }
++                g.slru.key_of[s] = cil * g.slru.n_expert + ce;
++                g.slru.set_resident(cil, ce, s);
++                g.slru.move(s, true);
++                const layer & cl = layers[cil];
++                for (size_t ip = 0; ip < cl.experts.size(); ++ip) {
++                    const ggml_tensor * w    = cl.experts[ip];
++                    ggml_tensor       * bank = g.banks[ip];
++                    const size_t expert_size = w->nb[2];
++                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + ce * expert_size, s * expert_size, expert_size);
++                }
++                uploaded++;
++            }
++            // PP FLUSH: Reset `pp_counts` AND flush `freq_score` down to a small seed (0.5f) so Rank-1
++            // (PP-only "Reader" experts that never fire in TG) have 0 `obj_score` and get kicked off
++            // first as soon as TG's Rank-3 ("Writer" experts) arrive, while Rank-2 ("Both") immediately
++            // build permanent `obj_score` on their first TG hit!
++            std::fill(g.slru.pp_counts.begin(), g.slru.pp_counts.end(), 0);
++            for (float & f : g.slru.freq_score) {
++                f = (f > 0.0f) ? 0.5f : 0.0f;
++            }
++            if (g.slru.full()) {
++                ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++                return true;
++            }
++        }
++
+         // In default split mode, once full, the cache freezes to avoid the per-layer device synchronize.
+-        // When GGML_MOE_DCT=1 is set, the cache uses periodic Reddit-score Clutch-B promotions (sampling
+-        // every Nth token or when not yet full) so residency adapts to topic shifts without stalling every layer.
++        // When GGML_MOE_DCT=N is set, the cache acts like a Continuous 1-Cart Roller Coaster IN THE SHADOWS:
++        //   - Instead of calling `ggml_backend_synchronize(backend)` (which stops the GPU mid-token!),
++        //   - On token `t`, we queue a non-blocking `ggml_backend_tensor_get_async` into `l.shadow_ids` and return immediately!
++        //   - On token `t + N` (when token `t` has already finished!), `l.shadow_ids` is sitting in host RAM ready to read
++        //     with ZERO `ggml_backend_synchronize` stalls, and we promote 1 new Crew Cart into Clutch B!
+         static const int dct_period = getenv("GGML_MOE_DCT") ? std::max(1, atoi(getenv("GGML_MOE_DCT"))) : 0;
+         if (split && g.slru.full()) {
+             if (dct_period == 0 || (++g.slru.step_clock % dct_period != 0)) {
+@@ -862,6 +979,39 @@ struct llama_moe_cache::impl {
+         }
+         GGML_ASSERT(ggml_is_contiguous(sel));
+ 
++        if (split && g.slru.full()) {
++            // Zero-Stall Shadow Coaster ("What We Do in the Shadows"):
++            // Once the cache is full in split mode, NEVER call `ggml_backend_synchronize(backend)`!
++            // Instead, if `l.has_shadow` is true from an earlier token's async read, consume `l.shadow_ids`
++            // right now (the earlier token has long since completed!), promote 1 Crew Cart in the background,
++            // and queue a fresh non-blocking `ggml_backend_tensor_get_async` into `l.shadow_ids` for next time!
++            if (l.has_shadow) {
++                size_t n_hit  = 0;
++                size_t n_miss = 0;
++                g.slru.plan(il, l.shadow_ids.data(), l.shadow_ids.size(), fills, n_hit, n_miss);
++                plan_pending[il] = 1;
++                size_t bytes = 0;
++                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                    const ggml_tensor * w    = l.experts[ip];
++                    ggml_tensor       * bank = g.banks[ip];
++                    const size_t expert_size = w->nb[2];
++                    for (size_t i = 0; i < fills.size(); ++i) {
++                        ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, expert_size);
++                        bytes += expert_size;
++                    }
++                }
++                stats & st = l.shadow_ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
++                st.hits   += n_hit;
++                st.misses += n_miss;
++                st.bytes  += bytes;
++            }
++            l.shadow_ids.resize(ggml_nelements(sel));
++            ggml_backend_tensor_get_async(backend, sel, l.shadow_ids.data(), 0, ggml_nbytes(sel));
++            l.has_shadow = true;
++            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++            return true;
++        }
++
+         ids.resize(ggml_nelements(sel));
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+         ggml_backend_synchronize(backend);
+@@ -955,6 +1105,10 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor
+     return pimpl->copy_experts(backend, w, dst, e, last);
+ }
+ 
++void llama_moe_cache::record_pp_experts(const ggml_tensor * w, const int32_t * ids_data, size_t n_ids) {
++    pimpl->record_pp_experts(w, ids_data, n_ids);
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> res;
+     for (const auto & d : pimpl->devices) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 458dbef78..df8110bc2 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -44,6 +44,9 @@ public:
+     // returns the number of experts copied, 0 if expert e is not in the cache
+     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+ 
++    // PP -> TG Dimter Tooling-List Handoff: record experts used during large-batch prompt prefill (PP)
++    void record_pp_experts(const ggml_tensor * w, const int32_t * ids_data, size_t n_ids);
++
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
+ private:
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 7dc5ee3a5..81f9c8807 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1306,6 +1306,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+             exp_probs_b = nullptr;
+         }
+ 
++        // Build the GPU-resident Shared Expert (`ffn_shexp`) FIRST so it fuses directly into the
++        // GPU's Attention split (or overlaps with CPU/RPC `moe_out`) instead of forcing an extra
++        // GPU -> CPU -> GPU split ping-pong on every `-ncmoe` layer!
++        ggml_tensor * ffn_shexp = build_ffn(cur,
++                layer.ffn_up_shexp, nullptr, nullptr,
++                layer.ffn_gate_shexp, nullptr, nullptr,
++                layer.ffn_down_shexp, nullptr, nullptr,
++                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++        cb(ffn_shexp, "ffn_shexp", il);
++        ggml_build_forward_expand(gf, ffn_shexp);
++
+         ggml_tensor * moe_out = build_moe_ffn(cur,
+                 layer.ffn_gate_inp,
+                 layer.ffn_up_exps,
+@@ -1325,13 +1336,6 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+                 selected_experts);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+-        ggml_tensor * ffn_shexp = build_ffn(cur,
+-                layer.ffn_up_shexp, nullptr, nullptr,
+-                layer.ffn_gate_shexp, nullptr, nullptr,
+-                layer.ffn_down_shexp, nullptr, nullptr,
+-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+-        cb(ffn_shexp, "ffn_shexp", il);
+-
+         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+         cb(cur, "ffn_out", il);
+ 
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index 395560990..dfe1a540a 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -746,6 +746,14 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
+                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+             cb(cur, "ffn_out", il);
+         } else {
++            ggml_tensor * ffn_shexp = build_ffn(cur,
++                    layer.ffn_up_shexp,   nullptr, nullptr,
++                    layer.ffn_gate_shexp, nullptr, nullptr,
++                    layer.ffn_down_shexp, nullptr, nullptr,
++                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++            cb(ffn_shexp, "ffn_shexp", il);
++            ggml_build_forward_expand(gf, ffn_shexp);
++
+             ggml_tensor * moe_out = build_moe_ffn(cur,
+                     layer.ffn_gate_inp,
+                     layer.ffn_up_exps,
+@@ -759,13 +767,6 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
+                     il);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+-            ggml_tensor * ffn_shexp = build_ffn(cur,
+-                    layer.ffn_up_shexp,   nullptr, nullptr,
+-                    layer.ffn_gate_shexp, nullptr, nullptr,
+-                    layer.ffn_down_shexp, nullptr, nullptr,
+-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+-            cb(ffn_shexp, "ffn_shexp", il);
+-
+             cur = ggml_add(ctx0, moe_out, ffn_shexp);
+             cb(cur, "ffn_out", il);
+         }
+diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+index 98fafd917..d97e3f10e 100644
+--- a/src/models/qwen3next.cpp
++++ b/src/models/qwen3next.cpp
+@@ -556,6 +556,30 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
+ ggml_tensor * llama_model_qwen3next::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+     // Check if this is an MoE layer
+     if (model.layers[il].ffn_gate_inp != nullptr) {
++        // Build GPU-resident Shared Expert (`ffn_shexp`) FIRST so it fuses into the GPU's Attention split
++        // instead of forcing an extra GPU -> CPU -> GPU split transition on `-ncmoe` layers!
++        ggml_tensor * ffn_shexp_gated = nullptr;
++        if (model.layers[il].ffn_up_shexp != nullptr) {
++            ggml_tensor * ffn_shexp =
++                build_ffn(cur,
++                    model.layers[il].ffn_up_shexp,   NULL, model.layers[il].ffn_up_shexp_s,
++                    model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
++                    model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
++                    NULL,
++                    LLM_FFN_SILU, LLM_FFN_PAR, il);
++            cb(ffn_shexp, "ffn_shexp", il);
++
++            ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
++            cb(shared_gate, "shared_expert_gate", il);
++
++            shared_gate = ggml_sigmoid(ctx0, shared_gate);
++            cb(shared_gate, "shared_expert_gate_sigmoid", il);
++
++            ffn_shexp_gated = ggml_mul(ctx0, ffn_shexp, shared_gate);
++            cb(ffn_shexp_gated, "ffn_shexp_gated", il);
++            ggml_build_forward_expand(gf, ffn_shexp_gated);
++        }
++
+         // MoE branch
+         ggml_tensor * moe_out =
+             build_moe_ffn(cur,
+@@ -574,30 +598,8 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_ffn(ggml_tensor * cur, c
+                 model.layers[il].ffn_down_exps_s);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+-        // Add shared experts if present - following Qwen3Next reference implementation
+-        if (model.layers[il].ffn_up_shexp != nullptr) {
+-            ggml_tensor * ffn_shexp =
+-                build_ffn(cur,
+-                    model.layers[il].ffn_up_shexp,   NULL, model.layers[il].ffn_up_shexp_s,
+-                    model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+-                    model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+-                    NULL,
+-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+-            cb(ffn_shexp, "ffn_shexp", il);
+-
+-            // Apply shared expert gating as in the reference implementation
+-            // The shared expert has its own gate that is sigmoided
+-            // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
+-            ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+-            cb(shared_gate, "shared_expert_gate", il);
+-
+-            shared_gate = ggml_sigmoid(ctx0, shared_gate);
+-            cb(shared_gate, "shared_expert_gate_sigmoid", il);
+-
+-            ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+-            cb(ffn_shexp, "ffn_shexp_gated", il);
+-
+-            cur = ggml_add(ctx0, moe_out, ffn_shexp);
++        if (ffn_shexp_gated != nullptr) {
++            cur = ggml_add(ctx0, moe_out, ffn_shexp_gated);
+             cb(cur, "ffn_out", il);
+         } else {
+             cur = moe_out;
+-- 
+2.55.0.windows.3
+
