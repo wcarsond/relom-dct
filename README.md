@@ -1,6 +1,6 @@
 # RELOM & DCT: Residual Order-of-Magnitude Quantization, Horner-Bucket Matmul, and Dual-Clutch MoE Tiering
 
-Measured on 2× Intel Arc Pro B60 (24 GB, PCIe Gen5 x8 each), 2× Predator GM7 1 TB NVMe (`C:` CPU-direct Gen4 x4 + `M:` PCH Gen4 x4), 64 GB DDR5-6000 (4× 16 GB), and a remote NVIDIA RTX 3070 (8 GB) over 2.5 GbE, running Windows 11.
+Measured on 2× Intel Arc Pro B60 (24 GB, PCIe Gen5 x8 each), 2× Predator GM7 1 TB NVMe (`C:` CPU-direct Gen4 x4 + `M:` PCH Gen4 x4), 64 GB DDR5-6000 (4× 16 GB), and a remote NVIDIA RTX 3070 (8 GB) over a direct 10 GbE link (9.12 Gbps measured; RPC rows marked 2.5 GbE were measured before the link was upgraded), running Windows 11.
 
 ---
 
@@ -59,8 +59,9 @@ To avoid over-claiming or reinventing textbook terms, here is the exact line bet
    - **DCT GPU+CPU Split Overlap (`ggml-backend.cpp`):** Fires the GPU's resident expert subgraph (`out_hit`) asynchronously *before* starting the CPU's missed-expert subgraph (`out_miss`), and overlaps multi-layer lookahead NVMe reads (`3.22×` end-to-end NVMe tier speedup in `dct_nvme_race.py`).
 6. **Distributed RPC Head Fix & On-the-Fly `Q12H` Wire Compression (`ggml-rpc.cpp` + `llama-graph.cpp`):**
    - Eliminated two unused `has_mixed` embedding input branches on pure token batches in `llama-graph.cpp` (`-95%` incoming wire bytes to an RPC head stage: `45.2 KiB -> 2.3 KiB/token`).
-   - Added live `Q12H` wire compression for `F32` activation tensors in `ggml-rpc.cpp` (`SET_TENSOR` and `GET_TENSOR`, `2.49×` smaller on the wire: `14.00 KiB -> 5.63 KiB`).
-   - Runs `Qwen3-Coder-Next 80B-A3B` (`46.2 GiB`) and `Qwen3-Coder-30B-A3B Q12H` (`45.94 GiB`) **100% in VRAM (`-ncmoe 0`)** across `ROG RTX 3070 (Head) + 2× Arc Pro B60 (Body)` over 2.5 GbE at **`1,055.7 tok/s` prefill / `50.3 tok/s` decode** (80B) and **`538.8 tok/s` prefill / `41.6 tok/s` decode** (30B Q12H).
+   - Added live `Q12H` wire compression for `F32` activation tensors in `ggml-rpc.cpp` (`SET_TENSOR` and `GET_TENSOR`, `2.49×` smaller on the wire: `14.00 KiB -> 5.63 KiB`). **This is lossy and opt-in (`GGML_RPC_WIRE_Q12H=1`, off by default, RPC protocol `8.0.2`):** activations are cut from `F32` to 16 bits and outliers beyond a block's 4 exception slots are snapped. Measured on the 30B `QL+Q8` across `RTX 3070 + 2× B60`: wire on against wire off = mean KLD `0.000971`, same top token `99.098%` (off against off repeats exactly: KLD `0`, `100%`); against `BF16`, off = `0.001632` / `98.870%`, on = `0.001707` / `98.729%`. It made no tok/s difference on 10 GbE.
+   - **Whole-file round-trip check (`ql_roundtrip.py`):** every `Q12H` tensor of both surgical backbones was dequantized and compared bit for bit with the Hugging Face `BF16` source: 80B `230` tensors / `1,402,470,400` weights and 120B `36` tensors / `424,673,280` weights, **zero differ**.
+   - Runs `Qwen3-Coder-Next 80B-A3B` (`46.2 GiB`) and `Qwen3-Coder-30B-A3B Q12H` (`45.94 GiB`) **100% in VRAM (`-ncmoe 0`)** across `ROG RTX 3070 (Head) + 2× Arc Pro B60 (Body)` over 2.5 GbE at **`1,055.7 tok/s` prefill / `50.3 tok/s` decode** (80B) and **`538.8 tok/s` prefill / `41.6 tok/s` decode** (30B Q12H). Over the direct 10 GbE link: `1,033.5` / `50.3` (80B), `534.9` / `42.7` (30B Q12H), `1,206.8` / `51.2` (30B `QL+Q8`); the link is not the bottleneck.
 
 ---
 

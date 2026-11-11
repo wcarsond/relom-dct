@@ -1,26 +1,42 @@
 From b07c8510d9285f3e8b74c9aca2d3649dc34f0d5c Mon Sep 17 00:00:00 2001
 From: wcarsond <wcarsond@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 01:23:54 -0500
-Subject: [PATCH] q12h: prioritize top-4 largest outliers for exception slots
- and snap sub-RELOM tail outliers
+Subject: [PATCH 5/6] q12h: prioritize top-4 largest outliers for exception
+ slots, enforce lossless weight quantization by default, and assert 256-align
 
 When a 256-weight block has >16 distinct exponents and >4 outlier weights
-outside the top-16 LUT (e.g. in 80B/120B embedding and attention matrices
-where tiny near-zero weights < 2^-16 * block_max sit at the bottom of the
-distribution), sort outliers by magnitude so the 4 exact 16-bit exception
-slots always protect the 4 largest outliers, and snap any remaining tiny
-sub-RELOM tail outliers to their nearest LUT exponent instead of aborting.
+outside the top-16 LUT, sort outliers by magnitude so the 4 exact 16-bit
+exception slots protect the 4 largest outliers. Weight-file quantization
+(quantize_q12h) aborts if any weight would be snapped unless
+GGML_Q12H_ALLOW_SNAP=1 is set, and asserts n_per_row % QK12H == 0 in
+Release builds as well.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 ---
- ggml/src/ggml-quants.c | 60 ++++++++++++++++++++++++++++++++----------
- 1 file changed, 46 insertions(+), 14 deletions(-)
+ ggml/src/ggml-quants.c | 84 ++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 67 insertions(+), 17 deletions(-)
 
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index f507c15af..3de3bab4e 100644
+index f507c15af..e4e4685e9 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
-@@ -129,12 +129,13 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
+@@ -89,9 +89,13 @@ static inline float q12h_shift_scale(int base) {
+     return f;
+ }
+ 
+-void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_RESTRICT y, int64_t k) {
+-    assert(k % QK12H == 0);
++// Returns the number of weights that did NOT survive bit-exact ("snapped": more than 4 outliers in a block).
++// 0 means the row is lossless. Weight files must get 0 (quantize_q12h asserts it); the lossy use is the
++// opt-in RPC wire compression of activations, which calls quantize_row_q12h_ref and ignores the count.
++static int64_t q12h_quantize_row(const float * GGML_RESTRICT x, block_q12h * GGML_RESTRICT y, int64_t k) {
++    GGML_ASSERT(k % QK12H == 0 && "q12h: row length must be a multiple of 256");
+     const int nb = k / QK12H;
++    int64_t n_snapped = 0;
+ 
+     for (int i = 0; i < nb; i++) {
+         uint16_t bits[QK12H];
+@@ -129,12 +133,13 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
              continue;
          }
  
@@ -36,7 +52,7 @@ index f507c15af..3de3bab4e 100644
                  if (inv[e] != 0xFF || cnt[e] == 0) continue;
                  if (best < 0 || cnt[e] > cnt[best]) best = e;
              }
-@@ -148,25 +149,56 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
+@@ -148,27 +153,65 @@ void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_REST
          // lut[0] == 0xFF is the shift-mode marker, so a LUT block must never hold
          // it. It only could for an inf/nan weight, which ggml rejects anyway.
          GGML_ASSERT(y[i].lut[0] != Q12H_MODE_SHIFT && "q12h: inf/nan exponent in a LUT-mode block");
@@ -96,6 +112,7 @@ index f507c15af..3de3bab4e 100644
 +                    }
 +                    ix = (uint8_t)best_s;
 +                    if (y[i].lut[best_s] == 0) sm &= 0x80; // clean zero mantissa if snapped to E=0
++                    n_snapped++;
 +                }
              }
              if (j & 1) y[i].nib[j >> 1] |= (uint8_t)(ix << 4);
@@ -104,7 +121,28 @@ index f507c15af..3de3bab4e 100644
 +            y[i].sm[j] = sm;
          }
      }
++    return n_snapped;
++}
++
++// Lossy-tolerant entry point (type traits, RPC wire): snaps tail outliers instead of failing.
++void quantize_row_q12h_ref(const float * GGML_RESTRICT x, block_q12h * GGML_RESTRICT y, int64_t k) {
++    (void) q12h_quantize_row(x, y, k);
  }
--- 
-2.55.0.windows.3
-
+ 
+ void dequantize_row_q12h(const block_q12h * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+@@ -2264,7 +2307,14 @@ size_t quantize_q12h(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+     const size_t row_size = ggml_row_size(GGML_TYPE_Q12H, n_per_row);
+     char * qrow = (char *)dst;
+     for (int64_t row = 0; row < nrow; ++row) {
+-        quantize_row_q12h_ref(src, (block_q12h *)qrow, n_per_row);
++        // Weight files are sold as lossless: a snapped weight is a hard error, never a silent one.
++        // (GGML_Q12H_ALLOW_SNAP=1 lets a deliberately lossy file through.)
++        const int64_t n_snapped = q12h_quantize_row(src, (block_q12h *)qrow, n_per_row);
++        if (n_snapped > 0 && !(getenv("GGML_Q12H_ALLOW_SNAP") && atoi(getenv("GGML_Q12H_ALLOW_SNAP")) != 0)) {
++            GGML_ABORT("q12h: %lld weight(s) in row %lld need more than 4 exception slots per block and would be "
++                       "snapped (not lossless); store this tensor as BF16 or set GGML_Q12H_ALLOW_SNAP=1",
++                       (long long) n_snapped, (long long) row);
++        }
+         src  += n_per_row;
+         qrow += row_size;
+     }

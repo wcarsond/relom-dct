@@ -1,15 +1,29 @@
 From f1149f0127f30989b7a7150755e10337f9052e9f Mon Sep 17 00:00:00 2001
 From: wcarsond <wcarsond@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 22:58:55 -0500
-Subject: [PATCH 4/4] ggml-rpc: live Q12H wire compression for F32 activations
- in SET_TENSOR and GET_TENSOR (2.49x smaller wire payload)
+Subject: [PATCH 4/6] ggml-rpc: opt-in Q12H wire compression for F32
+ activations (GGML_RPC_WIRE_Q12H=1) and bump RPC protocol to 8.0.2
 
 ---
- ggml/src/ggml-rpc/ggml-rpc.cpp | 65 ++++++++++++++++++++++++++++++----
- 1 file changed, 59 insertions(+), 6 deletions(-)
+ ggml/include/ggml-rpc.h        |  2 +-
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 68 ++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 63 insertions(+), 7 deletions(-)
 
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index ecf0a3a6d..cbb9d5237 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,7 +8,7 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    8
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    1
++#define RPC_PROTO_PATCH_VERSION    2
+ 
+ #ifdef  __cplusplus
+ static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 5cedd89ad..830c5479a 100644
+index 5cedd89ad..d7de0b2a4 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -2,6 +2,7 @@
@@ -20,13 +34,16 @@ index 5cedd89ad..830c5479a 100644
  #include "transport.h"
  #include "auth.h"
  #include "log.h"
-@@ -831,7 +832,26 @@ static void ggml_backend_rpc_buffer_memset_tensor(
+@@ -831,7 +832,29 @@ static void ggml_backend_rpc_buffer_memset_tensor(
  }
  
  // input serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes)
 +// When cache_flag == 2, `data` is an F32 activation tensor compressed on the wire as Q12H (2.5x smaller than F32)!
++// LOSSY and therefore opt-in (GGML_RPC_WIRE_Q12H=1, read on the client): F32 activations are cut to 16 bits and
++// outliers beyond a block's 4 exception slots are snapped. Measured 2026-11-10 on the 30B QL+Q8 over RPC:
++// wire on against wire off = mean KLD 0.000971, same top token 99.098% (off against off repeats exactly).
 +static bool rpc_can_q12h_wire(const ggml_tensor * tensor, size_t size) {
-+    static const bool enabled = getenv("GGML_RPC_WIRE_Q12H") == nullptr || atoi(getenv("GGML_RPC_WIRE_Q12H")) != 0;
++    static const bool enabled = getenv("GGML_RPC_WIRE_Q12H") != nullptr && atoi(getenv("GGML_RPC_WIRE_Q12H")) != 0;
 +    return enabled && tensor->type == GGML_TYPE_F32 && tensor->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
 +           size >= 4096 && (size % (QK12H * sizeof(float)) == 0);
 +}
@@ -47,7 +64,7 @@ index 5cedd89ad..830c5479a 100644
      input_size = sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset) + size;
      uint8_t * input = new uint8_t[input_size]();
      uint8_t * p = input;
-@@ -871,6 +891,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+@@ -871,6 +894,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
          }
          // the server has no cache entry for this tensor - ask it to save one
          cache_flag = 1;
@@ -56,7 +73,7 @@ index 5cedd89ad..830c5479a 100644
      }
      size_t input_size;
      auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
-@@ -928,6 +950,16 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
+@@ -928,6 +953,16 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
      auto request = std::make_shared<rpc_msg_get_tensor_req>();
      request->tensor = serialize_tensor(tensor);
      request->offset = offset;
@@ -73,7 +90,7 @@ index 5cedd89ad..830c5479a 100644
      request->size = size;
      ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
  }
-@@ -1172,6 +1204,8 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
+@@ -1172,6 +1207,8 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
          }
          // the server has no cache entry for this tensor - ask it to save one
          cache_flag = 1;
@@ -82,7 +99,7 @@ index 5cedd89ad..830c5479a 100644
      }
      size_t input_size;
      auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
-@@ -1712,7 +1746,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+@@ -1712,7 +1749,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
      const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
      memcpy(&cache_flag, input.data() + sizeof(rpc_tensor), sizeof(cache_flag));
      memcpy(&offset,     input.data() + sizeof(rpc_tensor) + sizeof(cache_flag), sizeof(offset));
@@ -91,7 +108,7 @@ index 5cedd89ad..830c5479a 100644
  
      struct ggml_init_params params {
          /*.mem_size   =*/ ggml_tensor_overhead(),
-@@ -1727,6 +1761,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+@@ -1727,6 +1764,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
          LOG_ERROR("[%s] error deserializing tensor\n", __func__);
          return false;
      }
@@ -99,7 +116,7 @@ index 5cedd89ad..830c5479a 100644
      LOG_DBG2("[%s] tensor: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %s\n",
              __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, offset,
              rpc_log_format_size(size).c_str());
-@@ -1744,6 +1779,12 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+@@ -1744,6 +1782,12 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
      }
  
      const void * data = input.data() + header_size;
@@ -112,7 +129,7 @@ index 5cedd89ad..830c5479a 100644
      if (cache_dir && cache_flag) {
          uint64_t hash = fnv_hash((const uint8_t*)data, size);
          char hash_str[17];
-@@ -1939,9 +1980,11 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
+@@ -1939,9 +1983,11 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
          LOG_ERROR("[%s] error deserializing tensor\n", __func__);
          return false;
      }
@@ -125,7 +142,7 @@ index 5cedd89ad..830c5479a 100644
  
      // sanitize tensor->data
      {
-@@ -1950,15 +1993,25 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
+@@ -1950,15 +1996,25 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
  
          if (request.tensor.data + request.offset < p0 ||
              request.tensor.data + request.offset >= p1 ||
@@ -155,6 +172,3 @@ index 5cedd89ad..830c5479a 100644
      return true;
  }
  
--- 
-2.55.0.windows.3
-
