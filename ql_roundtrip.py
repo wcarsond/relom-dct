@@ -37,7 +37,7 @@ class Traits(ctypes.Structure):
                 ("type_size", ctypes.c_size_t), ("is_quantized", ctypes.c_bool),
                 ("to_float", ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64)),
                 ("from_float_ref", ctypes.c_void_p)]
-dll = ctypes.CDLL(r"D:\agent-wt\q12h-moe\build-vk\bin\Release\ggml-base.dll")
+dll = ctypes.CDLL(os.environ.get("GGML_BASE_DLL", "ggml-base.dll"))
 dll.ggml_get_type_traits.restype = ctypes.POINTER(Traits)
 tr = dll.ggml_get_type_traits(Q12H).contents
 assert tr.type_name == b"q12h" and tr.blck_size == QK, (tr.type_name, tr.blck_size)
